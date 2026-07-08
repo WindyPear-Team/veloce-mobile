@@ -3,9 +3,10 @@ import * as DocumentPicker from "expo-document-picker";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { Bot, Check, ChevronDown, ChevronRight, Menu, Plus, Send, Settings, Square, Trash2, X } from "lucide-react-native";
+import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Animated, FlatList, Image, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { Alert, Animated, FlatList, Image, Keyboard, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { SvgUri } from "react-native-svg";
 import { completeSession, createMessage, createSession, decideConnectorTask, deleteSession, getAgents, getCatalog, getPendingConnectorApprovals, getSessions, isRunActive, messageContentWithAttachments, saveSession, selectedSessionKey, stopRun, titleFromMessages, uploadAttachment } from "../api/chat";
 import { IconButton } from "../components/IconButton";
@@ -15,6 +16,7 @@ import type { ChatAgent, ChatAttachment, ChatMessage, ChatSession, ConnectorAppr
 type Props = NativeStackScreenProps<RootStackParamList, "Chat">;
 
 export function ChatScreen({ navigation, route }: Props) {
+  const insets = useSafeAreaInsets();
   const [session, setSession] = useState<ChatSession | null>(null);
   const [catalog, setCatalog] = useState<UserChannelCatalog[]>([]);
   const [agents, setAgents] = useState<ChatAgent[]>([]);
@@ -29,6 +31,7 @@ export function ChatScreen({ navigation, route }: Props) {
   const [uploading, setUploading] = useState(false);
   const [approvalTasks, setApprovalTasks] = useState<ConnectorApprovalTask[]>([]);
   const [decidingTaskID, setDecidingTaskID] = useState("");
+  const [keyboardSpacer, setKeyboardSpacer] = useState(0);
   const listRef = useRef<FlatList<ChatMessage> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -77,6 +80,20 @@ export function ChatScreen({ navigation, route }: Props) {
   }, [navigation]);
 
   useEffect(() => {
+    if (Platform.OS !== "android") {
+      return;
+    }
+    const show = Keyboard.addListener("keyboardDidShow", (event) => {
+      setKeyboardSpacer(Math.min(64, Math.max(0, event.endCoordinates.height - insets.bottom)));
+    });
+    const hide = Keyboard.addListener("keyboardDidHide", () => setKeyboardSpacer(0));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, [insets.bottom]);
+
+  useEffect(() => {
     if (!session || !isRunActive(session)) {
       return;
     }
@@ -100,6 +117,12 @@ export function ChatScreen({ navigation, route }: Props) {
       requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
     }
   }, [sending, session?.latest_run?.status]);
+
+  useEffect(() => {
+    if (session?.messages.length) {
+      requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
+    }
+  }, [session?.messages]);
 
   const activeRunID = session?.latest_run?.id || "";
   const hasApprovalRequiredToolCall = useMemo(
@@ -367,10 +390,11 @@ export function ChatScreen({ navigation, route }: Props) {
   const working = sending || stopping || isRunActive(session || undefined);
   const sendDisabled = !working && !prompt.trim() && attachments.length === 0;
   const workingStatus = stopping ? "正在停止..." : runStatus(session?.latest_run?.status_message || session?.latest_run?.status || "running");
+  const latestButtonBottom = keyboardSpacer + 118 + (attachments.length > 0 ? 38 : 0);
 
   return (
     <SafeAreaView edges={["bottom"]} style={styles.safe}>
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.screen} keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}>
+      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.screen} keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}>
         {session ? (
           <>
             <View style={styles.sessionBar}>
@@ -391,11 +415,15 @@ export function ChatScreen({ navigation, route }: Props) {
               data={session.messages}
               keyExtractor={(item) => item.id}
               contentContainerStyle={session.messages.length ? styles.messages : styles.emptyMessages}
-              renderItem={({ item }) => <MessageBubble message={item} assistantName={assistantName} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={decideApproval} />}
+              renderItem={({ item }) => <MessageBubble message={item} activeRun={session.latest_run} assistantName={assistantName} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={decideApproval} />}
               ListEmptyComponent={<EmptyState hasCatalog={catalog.length > 0} />}
               ListFooterComponent={working ? <AssistantWorking status={workingStatus} assistantName={assistantName} /> : null}
-              onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
             />
+            {session.messages.length > 0 ? (
+              <Pressable onPress={() => listRef.current?.scrollToEnd({ animated: true })} style={({ pressed }) => [styles.latestButton, { bottom: latestButtonBottom }, pressed && styles.sendPressed]}>
+                <ChevronDown size={22} color="#fff" />
+              </Pressable>
+            ) : null}
 
             {attachments.length > 0 ? (
               <View style={styles.attachments}>
@@ -433,6 +461,7 @@ export function ChatScreen({ navigation, route }: Props) {
                 {working ? <Square size={18} color="#fff" fill="#fff" /> : <Send size={20} color="#fff" />}
               </Pressable>
             </View>
+            {keyboardSpacer > 0 ? <View style={{ height: keyboardSpacer }} /> : null}
             <SessionDrawer
               open={drawerOpen}
               sessions={sessions}
@@ -606,24 +635,43 @@ function SessionDrawer({
 
 function MessageBubble({
   message,
+  activeRun,
   assistantName,
   approvalTasks,
   decidingTaskID,
   onDecide,
 }: {
   message: ChatMessage;
+  activeRun?: ChatSession["latest_run"];
   assistantName: string;
   approvalTasks: ConnectorApprovalTask[];
   decidingTaskID: string;
   onDecide: (taskID: string, approved: boolean) => void;
 }) {
   const isUser = message.role === "user";
+  const parts = messageDisplayParts(message, activeRun);
+  const toolCallsByRound = groupToolCallsByRound(message.tool_calls || []);
+  const rounds = orderedMessageRounds(parts, toolCallsByRound);
   return (
     <View style={[styles.bubbleRow, isUser && styles.bubbleRowUser]}>
       <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
         <Text style={[styles.bubbleRole, isUser && styles.userBubbleRole]}>{isUser ? "你" : assistantName}</Text>
-        <Text selectable style={[styles.bubbleText, isUser && styles.userBubbleText]}>{message.content || " "}</Text>
-        {message.tool_calls?.length ? <ToolCallList calls={message.tool_calls} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={onDecide} /> : null}
+        {isUser ? (
+          <MarkdownText content={messageDisplayContent(message, activeRun) || " "} user />
+        ) : (
+          rounds.map((round) => {
+            const roundParts = parts.filter((part) => normalizedRound(part.round) === round);
+            const roundToolCalls = toolCallsByRound.get(round) || [];
+            return (
+              <View key={round} style={styles.messageRound}>
+                {roundParts.map((part, index) => (
+                  <MarkdownText key={`${round}-part-${index}`} content={part.content} />
+                ))}
+                {roundToolCalls.length > 0 ? <ToolCallList calls={roundToolCalls} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={onDecide} /> : null}
+              </View>
+            );
+          })
+        )}
       </View>
     </View>
   );
@@ -682,6 +730,140 @@ function AssistantWorking({ status, assistantName }: { status: string; assistant
   );
 }
 
+function MarkdownText({ content, user }: { content: string; user?: boolean }) {
+  const blocks = parseMarkdownBlocks(content);
+  return (
+    <View style={styles.markdownRoot}>
+      {blocks.map((block, index) => {
+        if (block.type === "space") {
+          return <View key={index} style={styles.markdownSpace} />;
+        }
+        if (block.type === "code") {
+          return (
+            <Text key={index} selectable style={[styles.markdownCodeBlock, user && styles.markdownCodeBlockUser]}>
+              {block.text}
+            </Text>
+          );
+        }
+        if (block.type === "heading") {
+          return (
+            <Text key={index} selectable style={[styles.bubbleText, styles.markdownHeading, user && styles.userBubbleText]}>
+              {renderInlineMarkdown(block.text, Boolean(user), `${index}`)}
+            </Text>
+          );
+        }
+        if (block.type === "quote") {
+          return (
+            <View key={index} style={[styles.markdownQuote, user && styles.markdownQuoteUser]}>
+              <Text selectable style={[styles.bubbleText, styles.markdownQuoteText, user && styles.userBubbleText]}>
+                {renderInlineMarkdown(block.text, Boolean(user), `${index}`)}
+              </Text>
+            </View>
+          );
+        }
+        if (block.type === "list") {
+          return (
+            <View key={index} style={styles.markdownListRow}>
+              <Text style={[styles.bubbleText, styles.markdownBullet, user && styles.userBubbleText]}>{block.marker}</Text>
+              <Text selectable style={[styles.bubbleText, styles.markdownListText, user && styles.userBubbleText]}>
+                {renderInlineMarkdown(block.text, Boolean(user), `${index}`)}
+              </Text>
+            </View>
+          );
+        }
+        return (
+          <Text key={index} selectable style={[styles.bubbleText, user && styles.userBubbleText]}>
+            {renderInlineMarkdown(block.text, Boolean(user), `${index}`)}
+          </Text>
+        );
+      })}
+    </View>
+  );
+}
+
+function parseMarkdownBlocks(content: string) {
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  const blocks: Array<{ type: "paragraph" | "heading" | "quote" | "list" | "code" | "space"; text: string; marker?: string }> = [];
+  let inCode = false;
+  let codeLines: string[] = [];
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      if (inCode) {
+        blocks.push({ type: "code", text: codeLines.join("\n") });
+        codeLines = [];
+        inCode = false;
+      } else {
+        inCode = true;
+      }
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+    const trimmed = line.trim();
+    if (!trimmed) {
+      blocks.push({ type: "space", text: "" });
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      blocks.push({ type: "heading", text: heading[2] });
+      continue;
+    }
+    if (trimmed.startsWith(">")) {
+      blocks.push({ type: "quote", text: trimmed.replace(/^>\s?/, "") });
+      continue;
+    }
+    const unordered = trimmed.match(/^[-*]\s+(.+)$/);
+    if (unordered) {
+      blocks.push({ type: "list", marker: "•", text: unordered[1] });
+      continue;
+    }
+    const ordered = trimmed.match(/^(\d+)[.)]\s+(.+)$/);
+    if (ordered) {
+      blocks.push({ type: "list", marker: `${ordered[1]}.`, text: ordered[2] });
+      continue;
+    }
+    blocks.push({ type: "paragraph", text: line });
+  }
+  if (inCode || codeLines.length > 0) {
+    blocks.push({ type: "code", text: codeLines.join("\n") });
+  }
+  return blocks;
+}
+
+function renderInlineMarkdown(text: string, user: boolean, keyPrefix: string) {
+  const nodes: ReactNode[] = [];
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+    const token = match[0];
+    if (token.startsWith("`")) {
+      nodes.push(
+        <Text key={`${keyPrefix}-code-${match.index}`} style={[styles.markdownInlineCode, user && styles.markdownInlineCodeUser]}>
+          {token.slice(1, -1)}
+        </Text>
+      );
+    } else {
+      nodes.push(
+        <Text key={`${keyPrefix}-bold-${match.index}`} style={styles.markdownBold}>
+          {token.slice(2, -2)}
+        </Text>
+      );
+    }
+    lastIndex = pattern.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes;
+}
+
 function ToolCallList({
   calls,
   approvalTasks,
@@ -730,7 +912,9 @@ function ToolCallDetails({
   return (
     <View style={styles.toolItem}>
       <Pressable onPress={() => setExpanded((value) => !value)} style={styles.toolSummary}>
-        <Text numberOfLines={1} style={styles.toolTitle}>{toolTitle(call)}</Text>
+        <View style={styles.toolTitleWrap}>
+          <Text numberOfLines={1} style={styles.toolTitle}>{toolTitle(call)}</Text>
+        </View>
         <Text style={[styles.toolStatus, toolStatusStyle(call.status)]}>{toolStatusText(call.status)}</Text>
         <Icon size={15} color={colors.muted} />
       </Pressable>
@@ -863,6 +1047,56 @@ function upsertSession(sessions: ChatSession[], next: ChatSession) {
   return sessions.some((item) => item.id === next.id)
     ? sessions.map((item) => item.id === next.id ? next : item)
     : [next, ...sessions];
+}
+
+function messageDisplayParts(message: ChatMessage, run?: ChatSession["latest_run"]) {
+  const parts = (message.content_parts || [])
+    .map((part) => ({ round: typeof part.round === "number" && part.round > 0 ? part.round : 1, content: (part.content || "").trim() }))
+    .filter((part) => part.content)
+    .sort((a, b) => a.round - b.round);
+  if (parts.length > 0) {
+    return parts;
+  }
+  if (message.content.trim()) {
+    return [{ round: 1, content: message.content }];
+  }
+  if (run && isRunActive({ latest_run: run } as ChatSession) && run.assistant_message_id === message.id) {
+    return [{ round: 1, content: runStatus(run.status_message || run.status || "running") }];
+  }
+  if (run?.status === "failed" && run.assistant_message_id === message.id) {
+    return [{ round: 1, content: run.error_message || "发送失败" }];
+  }
+  if (message.role === "assistant" && (message.tool_calls || []).length > 0) {
+    return [];
+  }
+  if (message.role === "assistant") {
+    return [{ round: 1, content: "暂无回复" }];
+  }
+  return message.content ? [{ round: 1, content: message.content }] : [];
+}
+
+function messageDisplayContent(message: ChatMessage, run?: ChatSession["latest_run"]) {
+  return messageDisplayParts(message, run).map((part) => part.content).join("\n\n");
+}
+
+function groupToolCallsByRound(calls: NonNullable<ChatMessage["tool_calls"]>) {
+  const groups = new Map<number, NonNullable<ChatMessage["tool_calls"]>>();
+  for (const call of calls) {
+    const round = normalizedRound(call.round);
+    groups.set(round, [...(groups.get(round) || []), call]);
+  }
+  return groups;
+}
+
+function orderedMessageRounds(parts: { round?: number; content: string }[], toolCallsByRound: Map<number, NonNullable<ChatMessage["tool_calls"]>>) {
+  const rounds = new Set<number>();
+  parts.forEach((part) => rounds.add(normalizedRound(part.round)));
+  toolCallsByRound.forEach((_calls, round) => rounds.add(round));
+  return Array.from(rounds).sort((a, b) => a - b);
+}
+
+function normalizedRound(round?: number) {
+  return typeof round === "number" && Number.isFinite(round) && round > 0 ? round : 1;
 }
 
 function updateApprovalToolCallStatus(session: ChatSession, taskID: string, status: string): ChatSession {
@@ -1177,29 +1411,102 @@ const styles = StyleSheet.create({
   userBubbleText: {
     color: "#fff",
   },
+  markdownRoot: {
+    gap: 4,
+  },
+  markdownSpace: {
+    height: 4,
+  },
+  markdownHeading: {
+    fontSize: 17,
+    lineHeight: 23,
+    fontWeight: "900",
+  },
+  markdownBold: {
+    fontWeight: "900",
+  },
+  markdownInlineCode: {
+    borderRadius: 5,
+    backgroundColor: colors.surfaceMuted,
+    paddingHorizontal: 4,
+    color: colors.text,
+    fontSize: 14,
+  },
+  markdownInlineCodeUser: {
+    backgroundColor: "rgba(255,255,255,0.18)",
+    color: "#fff",
+  },
+  markdownCodeBlock: {
+    borderRadius: 8,
+    backgroundColor: colors.surfaceMuted,
+    padding: 10,
+    color: colors.text,
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  markdownCodeBlockUser: {
+    backgroundColor: "rgba(255,255,255,0.16)",
+    color: "#fff",
+  },
+  markdownQuote: {
+    borderLeftWidth: 3,
+    borderLeftColor: colors.border,
+    paddingLeft: 9,
+  },
+  markdownQuoteUser: {
+    borderLeftColor: "rgba(255,255,255,0.42)",
+  },
+  markdownQuoteText: {
+    color: colors.muted,
+  },
+  markdownListRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 6,
+  },
+  markdownBullet: {
+    width: 20,
+    textAlign: "right",
+  },
+  markdownListText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  messageRound: {
+    gap: 6,
+  },
   toolText: {
     marginTop: 4,
     color: colors.muted,
     fontSize: 12,
   },
   toolList: {
+    alignSelf: "stretch",
+    minWidth: 240,
     marginTop: 6,
     gap: 6,
   },
   toolSummary: {
+    width: "100%",
     minHeight: 34,
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
   },
   toolTitle: {
-    flex: 1,
-    minWidth: 0,
+    width: "100%",
     color: colors.text,
     fontSize: 12,
     fontWeight: "800",
   },
+  toolTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+  },
   toolItem: {
+    alignSelf: "stretch",
+    minWidth: 240,
     borderRadius: 8,
     borderWidth: 1,
     borderColor: colors.border,
@@ -1220,6 +1527,7 @@ const styles = StyleSheet.create({
     fontWeight: "900",
   },
   toolStatus: {
+    flexShrink: 0,
     overflow: "hidden",
     borderRadius: 6,
     paddingHorizontal: 6,
@@ -1501,6 +1809,21 @@ const styles = StyleSheet.create({
   },
   stopSendPressed: {
     backgroundColor: "#b91c1c",
+  },
+  latestButton: {
+    position: "absolute",
+    right: 16,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: colors.primary,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOpacity: 0.16,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
   },
   emptyState: {
     alignItems: "center",
