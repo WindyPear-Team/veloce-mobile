@@ -3,6 +3,9 @@ export type RootStackParamList = {
   Chat: { sessionID?: string } | undefined;
   Sessions: undefined;
   Settings: undefined;
+  SessionSettings: { sessionID?: string } | undefined;
+  SessionSettingDetail: { sessionID: string; section: "mode" | "channel" | "agent" | "studio" | "skills" | "mcp" | "connector" };
+  SessionAddItems: { sessionID: string; type: "skills" | "mcp" };
   Server: undefined;
 };
 
@@ -38,6 +41,17 @@ export interface ChatMessage {
   created_at: string;
   updated_at?: string;
   tool_calls?: ChatToolCall[];
+}
+
+export interface ChatAttachment {
+  id: string;
+  storage_id?: string;
+  name: string;
+  type: string;
+  size: number;
+  text?: string;
+  binary?: boolean;
+  truncated?: boolean;
 }
 
 export interface ChatRun {
@@ -119,4 +133,3 @@ export interface AdvancedChatSettings {
   assistant_mode_enabled: boolean;
   assistant_mcp_tools_enabled: boolean;
 }
-

@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { Plus, Trash2 } from "lucide-react-native";
+import { MoreHorizontal, Plus } from "lucide-react-native";
 import { useCallback, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { createSession, deleteSession, getSessions, saveSession, selectedSessionKey, titleFromMessages } from "../api/chat";
@@ -59,6 +59,14 @@ export function SessionListScreen({ navigation }: Props) {
     }
   };
 
+  const showActions = (session: ChatSession) => {
+    Alert.alert(session.title || "未命名会话", "选择操作", [
+      { text: "取消", style: "cancel" },
+      { text: "会话设置", onPress: () => navigation.navigate("SessionSettings", { sessionID: session.id }) },
+      { text: "删除", style: "destructive", onPress: () => void remove(session.id) },
+    ]);
+  };
+
   return (
     <ScrollView contentContainerStyle={styles.screen}>
       <AppButton onPress={create} style={styles.newButton}>
@@ -74,17 +82,17 @@ export function SessionListScreen({ navigation }: Props) {
       {sessions.map((session) => {
         const selected = session.id === activeID;
         return (
-          <Pressable key={session.id} onPress={() => void select(session.id)} style={[styles.item, selected && styles.selected]}>
+          <Pressable
+            key={session.id}
+            onPress={() => void select(session.id)}
+            onLongPress={() => showActions(session)}
+            style={[styles.item, selected && styles.selected]}
+          >
             <View style={styles.itemCopy}>
               <Text numberOfLines={1} style={styles.title}>{session.title || titleFromMessages(session.messages)}</Text>
-              <Text numberOfLines={1} style={styles.subtitle}>{session.messages.length} 条消息 · {modeLabel(session.run_mode)}</Text>
+              <Text numberOfLines={1} style={styles.subtitle}>{session.messages.length} 条消息 · {modeLabel(session.run_mode)} · 长按设置</Text>
             </View>
-            <IconButton icon={Trash2} label="删除会话" color={colors.danger} onPress={() => {
-              Alert.alert("删除会话", session.title || "未命名会话", [
-                { text: "取消", style: "cancel" },
-                { text: "删除", style: "destructive", onPress: () => void remove(session.id) },
-              ]);
-            }} />
+            <IconButton icon={MoreHorizontal} label="会话操作" onPress={() => showActions(session)} />
           </Pressable>
         );
       })}

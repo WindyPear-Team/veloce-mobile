@@ -1,8 +1,10 @@
 import { apiRequest } from "./client";
+import { apiURL, getAuthToken } from "./client";
 import type {
   AdvancedChatSettings,
   ChatAgent,
   ChatAgentGroup,
+  ChatAttachment,
   ChatMessage,
   ChatRunMode,
   ChatSession,
@@ -60,6 +62,35 @@ export async function deleteSession(sessionID: string) {
 
 export async function stopRun(runID: string) {
   return apiRequest(`/user/advanced-chat/runs/${encodeURIComponent(runID)}/stop`, { method: "POST" });
+}
+
+export async function uploadAttachment(asset: { uri: string; name?: string; mimeType?: string; size?: number }): Promise<ChatAttachment> {
+  const formData = new FormData();
+  const name = asset.name || "attachment";
+  const type = asset.mimeType || "application/octet-stream";
+  formData.append("file", { uri: asset.uri, name, type } as unknown as Blob);
+  const token = await getAuthToken();
+  const response = await fetch(await apiURL("/user/advanced-chat/files"), {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    body: formData,
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(typeof body?.error === "string" ? body.error : `HTTP ${response.status}`);
+  }
+  const file = body?.file || {};
+  const content = body?.content || {};
+  return {
+    id: String(file.id || `${Date.now()}`),
+    storage_id: String(file.id || ""),
+    name: String(file.name || name),
+    type: String(file.type || type),
+    size: Number(file.size || asset.size || 0),
+    text: typeof content.text === "string" ? content.text : "",
+    binary: content.binary === true,
+    truncated: content.truncated === true,
+  };
 }
 
 export async function completeSession(session: ChatSession, messages: ChatMessage[]) {
@@ -142,6 +173,22 @@ export function titleFromMessages(messages: ChatMessage[]) {
   return title.slice(0, 28);
 }
 
+export function messageContentWithAttachments(content: string, attachments: ChatAttachment[]) {
+  if (attachments.length === 0) return content;
+  const sections = attachments.map((attachment) => {
+    const fileID = attachment.storage_id ? `; file_id=${attachment.storage_id}` : "";
+    const header = `[Attachment: ${attachment.name}; type=${attachment.type}; size=${formatBytes(attachment.size)}${fileID}]`;
+    if (!attachment.text) {
+      if (attachment.type.toLowerCase().startsWith("image/") && attachment.storage_id) {
+        return `${header}\n(image attached for model vision input)`;
+      }
+      return `${header}\n(binary content omitted)`;
+    }
+    return `${header}\n${attachment.text.slice(0, 20000)}${attachment.truncated ? "\n...(truncated)" : ""}`;
+  });
+  return [content, sections.join("\n\n")].filter(Boolean).join("\n\n");
+}
+
 export { selectedSessionKey };
 
 function normalizeSession(value: ChatSession): ChatSession {
@@ -188,3 +235,9 @@ function createID(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}

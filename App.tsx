@@ -11,7 +11,8 @@ import { ChatScreen } from "./src/screens/ChatScreen";
 import { LoginScreen } from "./src/screens/LoginScreen";
 import { ServerScreen } from "./src/screens/ServerScreen";
 import { SessionListScreen } from "./src/screens/SessionListScreen";
-import { SettingsScreen } from "./src/screens/SettingsScreen";
+import { SessionAddItemsScreen, SessionSettingDetailScreen, SessionSettingsScreen } from "./src/screens/SessionSettingsV2";
+import { ClientSettingsScreen } from "./src/screens/ClientSettingsScreen";
 import { colors } from "./src/theme/colors";
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -68,7 +69,10 @@ export default function App() {
               <>
                 <Stack.Screen name="Chat" component={ChatScreen} options={{ title: "聊天" }} />
                 <Stack.Screen name="Sessions" component={SessionListScreen} options={{ title: "会话" }} />
-                <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: "设置" }} />
+                <Stack.Screen name="Settings" component={ClientSettingsScreen} options={{ title: "客户端设置" }} />
+                <Stack.Screen name="SessionSettings" component={SessionSettingsScreen} options={{ title: "会话设置" }} />
+                <Stack.Screen name="SessionSettingDetail" component={SessionSettingDetailScreen} options={{ title: "设置项" }} />
+                <Stack.Screen name="SessionAddItems" component={SessionAddItemsScreen} options={{ title: "添加" }} />
                 <Stack.Screen name="Server" component={ServerScreen} options={{ title: "服务器" }} />
               </>
             ) : (
@@ -83,4 +87,3 @@ export default function App() {
     </SafeAreaProvider>
   );
 }
-

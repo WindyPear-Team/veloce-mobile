@@ -118,6 +118,11 @@ export function apiRequest<T>(path: string, init: RequestInit = {}) {
   return request<T>(path, init, true);
 }
 
+export async function apiURL(path: string) {
+  const serverURL = await getServerURL();
+  return `${serverURL}/api${path.startsWith("/") ? path : `/${path}`}`;
+}
+
 export function publicRequest<T>(path: string, init: RequestInit = {}) {
   return request<T>(path, init, false);
 }
@@ -151,4 +156,3 @@ function tryJSON(text: string) {
     return text;
   }
 }
-

@@ -1,23 +1,29 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as DocumentPicker from "expo-document-picker";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { List, Send, Server, Settings } from "lucide-react-native";
+import { Bot, ChevronDown, ChevronRight, Menu, Plus, Send, Settings, Trash2, X } from "lucide-react-native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, Animated, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { completeSession, createMessage, createSession, getCatalog, getSessions, isRunActive, saveSession, selectedSessionKey, stopRun, titleFromMessages } from "../api/chat";
+import { completeSession, createMessage, createSession, deleteSession, getCatalog, getSessions, isRunActive, messageContentWithAttachments, saveSession, selectedSessionKey, stopRun, titleFromMessages, uploadAttachment } from "../api/chat";
 import { IconButton } from "../components/IconButton";
 import { colors } from "../theme/colors";
-import type { ChatMessage, ChatSession, RootStackParamList, UserChannelCatalog } from "../types";
+import type { ChatAttachment, ChatMessage, ChatSession, RootStackParamList, UserChannelCatalog } from "../types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "Chat">;
 
 export function ChatScreen({ navigation, route }: Props) {
   const [session, setSession] = useState<ChatSession | null>(null);
   const [catalog, setCatalog] = useState<UserChannelCatalog[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [prompt, setPrompt] = useState("");
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const listRef = useRef<FlatList<ChatMessage> | null>(null);
 
   const load = useCallback(async () => {
@@ -29,13 +35,16 @@ export function ChatScreen({ navigation, route }: Props) {
         AsyncStorage.getItem(selectedSessionKey),
       ]);
       setCatalog(channels);
-      const requestedID = route.params?.sessionID || storedID || "";
-      let active = sessions.find((item) => item.id === requestedID) || sessions[0] || null;
-      if (!active) {
-        active = createSession(defaultSessionConfig(channels));
-        active = await saveSession(active);
+      setSessions(sessions);
+      const requestedID = route.params?.sessionID || "";
+      const active = requestedID
+        ? sessions.find((item) => item.id === requestedID) || createSession(defaultSessionConfig(channels))
+        : createSession(defaultSessionConfig(channels));
+      if (requestedID && sessions.some((item) => item.id === requestedID)) {
+        await AsyncStorage.setItem(selectedSessionKey, active.id);
+      } else if (!requestedID && storedID) {
+        await AsyncStorage.removeItem(selectedSessionKey);
       }
-      await AsyncStorage.setItem(selectedSessionKey, active.id);
       setSession(active);
     } catch (err) {
       Alert.alert("加载失败", err instanceof Error ? err.message : "无法加载聊天。");
@@ -50,11 +59,10 @@ export function ChatScreen({ navigation, route }: Props) {
 
   useEffect(() => {
     navigation.setOptions({
+      headerLeft: () => <IconButton icon={Menu} label="会话" onPress={() => setDrawerOpen(true)} />,
       headerRight: () => (
         <View style={styles.headerActions}>
-          <IconButton icon={List} label="会话" onPress={() => navigation.navigate("Sessions")} />
           <IconButton icon={Settings} label="设置" onPress={() => navigation.navigate("Settings")} />
-          <IconButton icon={Server} label="服务器" onPress={() => navigation.navigate("Server")} />
         </View>
       ),
     });
@@ -70,6 +78,7 @@ export function ChatScreen({ navigation, route }: Props) {
         const updated = sessions.find((item) => item.id === session.id);
         if (updated) {
           setSession(updated);
+          setSessions(sessions);
         }
       } catch {
         // Keep the current optimistic state; the next refresh can recover.
@@ -80,34 +89,43 @@ export function ChatScreen({ navigation, route }: Props) {
 
   const missingConfig = useMemo(() => {
     if (!session) return "";
-    if (session.run_mode !== "agent_group" && !session.model_name) return "请先在设置页选择模型。";
-    if (session.run_mode !== "agent_group" && !session.user_channel_id) return "请先在设置页选择渠道。";
-    if (session.run_mode === "agent_group" && !session.agent_group_id) return "请先在设置页选择工作室。";
+    if (session.run_mode !== "agent_group" && !session.model_name) return "请先选择模型。";
+    if (session.run_mode !== "agent_group" && !session.user_channel_id) return "请先在会话设置里选择渠道。";
+    if (session.run_mode === "agent_group" && !session.agent_group_id) return "请先在会话设置里选择工作室。";
     return "";
   }, [session]);
+  const modelOptions = useMemo(() => Array.from(new Set(catalog.flatMap((item) => item.models || []))), [catalog]);
 
   const send = async () => {
     const content = prompt.trim();
-    if (!session || !content || sending) return;
+    if (!session || (!content && attachments.length === 0) || sending) return;
+    const persistedSession = await ensurePersistedSession(session);
     if (missingConfig) {
       Alert.alert("配置不完整", missingConfig);
-      navigation.navigate("Settings");
+      if (!persistedSession.model_name) {
+        setModelMenuOpen(true);
+      } else {
+        navigation.navigate("SessionSettings", { sessionID: persistedSession.id });
+      }
       return;
     }
-    const userMessage = createMessage("user", content);
+    const messageContent = messageContentWithAttachments(content, attachments);
+    const userMessage = createMessage("user", messageContent);
     const nextSession = {
-      ...session,
-      title: session.title || titleFromMessages([...session.messages, userMessage]),
-      messages: [...session.messages, userMessage],
+      ...persistedSession,
+      title: persistedSession.title || titleFromMessages([...persistedSession.messages, userMessage]),
+      messages: [...persistedSession.messages, userMessage],
       updated_at: new Date().toISOString(),
     };
     setSession(nextSession);
     setPrompt("");
+    setAttachments([]);
     setSending(true);
     try {
       const result = await completeSession(nextSession, nextSession.messages);
       if (result.session) {
         setSession(result.session);
+        setSessions((current) => upsertSession(current, result.session as ChatSession));
       } else if (result.message?.content) {
         const assistantMessage = {
           ...createMessage("assistant", result.message.content),
@@ -115,19 +133,120 @@ export function ChatScreen({ navigation, route }: Props) {
           content_parts: result.message.content_parts || [{ round: 1, content: result.message.content }],
           tool_calls: result.message.tool_calls || [],
         };
-        setSession((current) => current ? { ...current, messages: [...current.messages, assistantMessage], updated_at: new Date().toISOString() } : current);
+        setSession((current) => {
+          if (!current) return current;
+          const next = { ...current, messages: [...current.messages, assistantMessage], updated_at: new Date().toISOString() };
+          setSessions((items) => upsertSession(items, next));
+          return next;
+        });
       } else {
         const sessions = await getSessions();
         const updated = sessions.find((item) => item.id === nextSession.id);
         if (updated) setSession(updated);
+        setSessions(sessions);
       }
     } catch (err) {
       Alert.alert("发送失败", err instanceof Error ? err.message : "请求失败。");
       setSession(session);
       setPrompt(content);
+      setAttachments(attachments);
     } finally {
       setSending(false);
     }
+  };
+
+  const pickAttachments = async () => {
+    if (uploading) return;
+    setUploading(true);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true });
+      if (result.canceled) return;
+      const next: ChatAttachment[] = [];
+      for (const asset of result.assets.slice(0, Math.max(1, 8 - attachments.length))) {
+        next.push(await uploadAttachment({ uri: asset.uri, name: asset.name, mimeType: asset.mimeType, size: asset.size }));
+      }
+      if (next.length) {
+        setAttachments((current) => [...current, ...next].slice(0, 8));
+      }
+    } catch (err) {
+      Alert.alert("上传失败", err instanceof Error ? err.message : "无法上传附件。");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const refreshSessions = async () => {
+    const items = await getSessions();
+    setSessions(items);
+    return items;
+  };
+
+  const selectSession = async (sessionID: string) => {
+    const next = sessions.find((item) => item.id === sessionID) || (await refreshSessions()).find((item) => item.id === sessionID);
+    if (!next) return;
+    await AsyncStorage.setItem(selectedSessionKey, next.id);
+    setSession(next);
+    setDrawerOpen(false);
+    navigation.setParams({ sessionID: next.id });
+  };
+
+  const ensurePersistedSession = async (target: ChatSession) => {
+    if (sessions.some((item) => item.id === target.id)) {
+      return target;
+    }
+    const saved = await saveSession(target);
+    await AsyncStorage.setItem(selectedSessionKey, saved.id);
+    setSessions((current) => upsertSession(current, saved));
+    setSession(saved);
+    navigation.setParams({ sessionID: saved.id });
+    return saved;
+  };
+
+  const updateSessionModel = async (modelName: string) => {
+    if (!session) return;
+    const next = { ...session, model_name: modelName, updated_at: new Date().toISOString() };
+    setSession(next);
+    setModelMenuOpen(false);
+    if (sessions.some((item) => item.id === next.id)) {
+      try {
+        const saved = await saveSession(next);
+        setSession(saved);
+        setSessions((current) => upsertSession(current, saved));
+      } catch (err) {
+        Alert.alert("保存失败", err instanceof Error ? err.message : "无法保存模型设置。");
+      }
+    }
+  };
+
+  const createNewSession = async () => {
+    const draft = createSession(defaultSessionConfig(catalog));
+    await AsyncStorage.removeItem(selectedSessionKey);
+    setSession(draft);
+    setDrawerOpen(false);
+    navigation.setParams({ sessionID: undefined });
+  };
+
+  const removeSession = async (sessionID: string) => {
+    await deleteSession(sessionID);
+    const nextSessions = sessions.filter((item) => item.id !== sessionID);
+    setSessions(nextSessions);
+    if (session?.id === sessionID) {
+      const next = nextSessions[0] || null;
+      setSession(next);
+      await AsyncStorage.setItem(selectedSessionKey, next?.id || "");
+      navigation.setParams({ sessionID: next?.id });
+    }
+  };
+
+  const showSessionActions = (target: ChatSession) => {
+    Alert.alert(target.title || "新会话", "选择操作", [
+      { text: "取消", style: "cancel" },
+      { text: "会话设置", onPress: () => {
+        setDrawerOpen(false);
+        navigation.navigate("SessionSettings", { sessionID: target.id });
+      } },
+      { text: "删除", style: "destructive", onPress: () => void removeSession(target.id) },
+    ]);
   };
 
   const stop = async () => {
@@ -164,7 +283,7 @@ export function ChatScreen({ navigation, route }: Props) {
             </View>
 
             {missingConfig ? (
-              <Pressable onPress={() => navigation.navigate("Settings")} style={styles.notice}>
+              <Pressable onPress={() => void ensurePersistedSession(session).then((saved) => navigation.navigate("SessionSettings", { sessionID: saved.id }))} style={styles.notice}>
                 <Text style={styles.noticeText}>{missingConfig}</Text>
               </Pressable>
             ) : null}
@@ -175,13 +294,38 @@ export function ChatScreen({ navigation, route }: Props) {
               keyExtractor={(item) => item.id}
               contentContainerStyle={session.messages.length ? styles.messages : styles.emptyMessages}
               renderItem={({ item }) => <MessageBubble message={item} />}
-              ListEmptyComponent={<EmptyState onOpenSettings={() => navigation.navigate("Settings")} hasCatalog={catalog.length > 0} />}
+              ListEmptyComponent={<EmptyState hasCatalog={catalog.length > 0} />}
               onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
             />
 
             {isRunActive(session) ? <Text style={styles.running}>{runStatus(session.latest_run?.status_message || session.latest_run?.status || "running")}</Text> : null}
 
+            {attachments.length > 0 ? (
+              <View style={styles.attachments}>
+                {attachments.map((attachment) => (
+                  <Pressable key={attachment.id} onPress={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} style={styles.attachmentChip}>
+                    <Text numberOfLines={1} style={styles.attachmentText}>{attachment.name}</Text>
+                    <X size={14} color={colors.muted} />
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
+
+            <View style={styles.modelToolbar}>
+              <Pressable onPress={() => setModelMenuOpen(true)} style={({ pressed }) => [styles.modelButton, pressed && styles.addPressed]}>
+                <Bot size={17} color={colors.primary} />
+                <Text numberOfLines={1} style={styles.modelButtonText}>{session.model_name || "选择模型"}</Text>
+                <ChevronDown size={15} color={colors.muted} />
+              </Pressable>
+              <Pressable onPress={() => void ensurePersistedSession(session).then((saved) => navigation.navigate("SessionSettings", { sessionID: saved.id }))} style={({ pressed }) => [styles.toolbarIconButton, pressed && styles.addPressed]}>
+                <Settings size={18} color={colors.text} />
+              </Pressable>
+            </View>
+
             <View style={styles.composer}>
+              <Pressable disabled={uploading} onPress={pickAttachments} style={({ pressed }) => [styles.addButton, pressed && styles.addPressed, uploading && styles.sendDisabled]}>
+                <Plus size={22} color={colors.primary} />
+              </Pressable>
               <TextInput
                 value={prompt}
                 onChangeText={setPrompt}
@@ -190,16 +334,129 @@ export function ChatScreen({ navigation, route }: Props) {
                 multiline
                 style={styles.input}
               />
-              <Pressable disabled={!prompt.trim() || sending || isRunActive(session)} onPress={send} style={({ pressed }) => [styles.sendButton, (!prompt.trim() || sending || isRunActive(session)) && styles.sendDisabled, pressed && styles.sendPressed]}>
+              <Pressable disabled={(!prompt.trim() && attachments.length === 0) || sending || isRunActive(session)} onPress={send} style={({ pressed }) => [styles.sendButton, ((!prompt.trim() && attachments.length === 0) || sending || isRunActive(session)) && styles.sendDisabled, pressed && styles.sendPressed]}>
                 <Send size={20} color="#fff" />
               </Pressable>
             </View>
+            <SessionDrawer
+              open={drawerOpen}
+              sessions={sessions}
+              activeID={sessions.some((item) => item.id === session.id) ? session.id : ""}
+              onClose={() => setDrawerOpen(false)}
+              onCreate={() => void createNewSession()}
+              onSelect={(id) => void selectSession(id)}
+              onLongPress={showSessionActions}
+            />
+            <ModelPicker
+              open={modelMenuOpen}
+              selectedModel={session.model_name || ""}
+              models={modelOptions}
+              onClose={() => setModelMenuOpen(false)}
+              onSelect={(model) => void updateSessionModel(model)}
+            />
           </>
         ) : (
           <Text style={styles.loading}>没有可用会话。</Text>
         )}
       </KeyboardAvoidingView>
     </SafeAreaView>
+  );
+}
+
+function ModelPicker({ open, selectedModel, models, onClose, onSelect }: { open: boolean; selectedModel: string; models: string[]; onClose: () => void; onSelect: (model: string) => void }) {
+  return (
+    <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.modelPickerRoot}>
+        <Pressable style={styles.modelPickerBackdrop} onPress={onClose} />
+        <SafeAreaView edges={["bottom"]} style={styles.modelPicker}>
+          <Text style={styles.modelPickerTitle}>选择模型</Text>
+          <FlatList
+            data={models}
+            keyExtractor={(item) => item}
+            style={styles.modelPickerList}
+            renderItem={({ item }) => {
+              const selected = item === selectedModel;
+              return (
+                <Pressable onPress={() => onSelect(item)} style={({ pressed }) => [styles.modelOption, selected && styles.modelOptionSelected, pressed && styles.addPressed]}>
+                  <Bot size={17} color={selected ? colors.primary : colors.muted} />
+                  <Text numberOfLines={1} style={styles.modelOptionText}>{item}</Text>
+                  {selected ? <Text style={styles.modelSelectedMark}>已选</Text> : null}
+                </Pressable>
+              );
+            }}
+            ListEmptyComponent={<Text style={styles.emptyDrawer}>当前账号还没有可用模型</Text>}
+          />
+        </SafeAreaView>
+      </View>
+    </Modal>
+  );
+}
+
+function SessionDrawer({
+  open,
+  sessions,
+  activeID,
+  onClose,
+  onCreate,
+  onSelect,
+  onLongPress,
+}: {
+  open: boolean;
+  sessions: ChatSession[];
+  activeID: string;
+  onClose: () => void;
+  onCreate: () => void;
+  onSelect: (sessionID: string) => void;
+  onLongPress: (session: ChatSession) => void;
+}) {
+  const slide = useRef(new Animated.Value(-320)).current;
+
+  useEffect(() => {
+    if (!open) return;
+    slide.setValue(-320);
+    Animated.timing(slide, {
+      toValue: 0,
+      duration: 180,
+      useNativeDriver: true,
+    }).start();
+  }, [open, slide]);
+
+  return (
+    <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.drawerRoot}>
+        <Pressable style={styles.drawerBackdrop} onPress={onClose} />
+        <Animated.View style={[styles.drawerAnimated, { transform: [{ translateX: slide }] }]}>
+        <SafeAreaView edges={["top", "bottom"]} style={styles.drawer}>
+          <View style={styles.drawerHeader}>
+            <Text style={styles.drawerTitle}>会话</Text>
+            <IconButton icon={X} label="关闭" onPress={onClose} />
+          </View>
+          <Pressable onPress={onCreate} style={styles.newSessionButton}>
+            <Plus size={18} color="#fff" />
+            <Text style={styles.newSessionText}>新建会话</Text>
+          </Pressable>
+          <FlatList
+            data={sessions}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={styles.drawerList}
+            renderItem={({ item }) => {
+              const selected = item.id === activeID;
+              return (
+                <Pressable onPress={() => onSelect(item.id)} onLongPress={() => onLongPress(item)} style={[styles.drawerItem, selected && styles.drawerItemActive]}>
+                  <View style={styles.drawerItemCopy}>
+                    <Text numberOfLines={1} style={styles.drawerItemTitle}>{item.title || titleFromMessages(item.messages)}</Text>
+                    <Text numberOfLines={1} style={styles.drawerItemMeta}>{item.messages.length} 条 · {modeLabel(item.run_mode)}</Text>
+                  </View>
+                  <Trash2 size={16} color={colors.muted} />
+                </Pressable>
+              );
+            }}
+            ListEmptyComponent={<Text style={styles.emptyDrawer}>还没有会话</Text>}
+          />
+        </SafeAreaView>
+        </Animated.View>
+      </View>
+    </Modal>
   );
 }
 
@@ -210,22 +467,52 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
         <Text style={[styles.bubbleRole, isUser && styles.userBubbleRole]}>{isUser ? "你" : "助理"}</Text>
         <Text selectable style={[styles.bubbleText, isUser && styles.userBubbleText]}>{message.content || " "}</Text>
-        {message.tool_calls?.length ? <Text style={styles.toolText}>{message.tool_calls.length} 次工具调用</Text> : null}
+        {message.tool_calls?.length ? <ToolCallList calls={message.tool_calls} /> : null}
       </View>
     </View>
   );
 }
 
-function EmptyState({ onOpenSettings, hasCatalog }: { onOpenSettings: () => void; hasCatalog: boolean }) {
+function ToolCallList({ calls }: { calls: NonNullable<ChatMessage["tool_calls"]> }) {
+  const [expanded, setExpanded] = useState(false);
+  const Icon = expanded ? ChevronDown : ChevronRight;
   return (
-    <View style={styles.emptyState}>
-      <Text style={styles.emptyTitle}>开始一个新会话</Text>
-      <Text style={styles.emptyText}>{hasCatalog ? "发送消息前可以先进入设置选择模型、助理、技能、MCP 和连接器。" : "当前服务器还没有读取到模型渠道，请检查账号或服务器配置。"}</Text>
-      <Pressable onPress={onOpenSettings} style={styles.emptyButton}>
-        <Text style={styles.emptyButtonText}>打开设置</Text>
+    <View style={styles.toolList}>
+      <Pressable onPress={() => setExpanded((value) => !value)} style={styles.toolSummary}>
+        <Text style={styles.toolTitle}>工具调用 · {calls.length}</Text>
+        <Icon size={15} color={colors.muted} />
       </Pressable>
+      {expanded ? (
+        calls.map((call, index) => (
+          <View key={call.id || `${call.name}-${index}`} style={styles.toolItem}>
+            <View style={styles.toolHeader}>
+              <Text numberOfLines={1} style={styles.toolName}>{call.name || call.tool || "tool"}</Text>
+              <Text style={[styles.toolStatus, toolStatusStyle(call.status)]}>{toolStatusText(call.status)}</Text>
+            </View>
+            {call.server || call.tool ? <Text numberOfLines={1} style={styles.toolMeta}>{[call.server, call.tool].filter(Boolean).join(" / ")}</Text> : null}
+            {call.result ? <Text numberOfLines={4} style={styles.toolResult}>{call.result}</Text> : null}
+          </View>
+        ))
+      ) : null}
     </View>
   );
+}
+
+function EmptyState({ hasCatalog }: { hasCatalog: boolean }) {
+  return (
+    <View style={styles.emptyState}>
+      <Text style={styles.greetingTitle}>{greetingTitle()}</Text>
+      <Text style={styles.emptyText}>{hasCatalog ? "有什么想处理的，直接告诉我。" : "当前服务器还没有读取到模型渠道，请检查账号或服务器配置。"}</Text>
+    </View>
+  );
+}
+
+function greetingTitle() {
+  const hour = new Date().getHours();
+  if (hour < 11) return "早上好";
+  if (hour < 14) return "中午好";
+  if (hour < 19) return "下午好";
+  return "晚上好";
 }
 
 function defaultSessionConfig(catalog: UserChannelCatalog[]): Partial<ChatSession> {
@@ -250,6 +537,25 @@ function runStatus(status: string) {
   return "助理正在运行...";
 }
 
+function upsertSession(sessions: ChatSession[], next: ChatSession) {
+  return sessions.some((item) => item.id === next.id)
+    ? sessions.map((item) => item.id === next.id ? next : item)
+    : [next, ...sessions];
+}
+
+function toolStatusText(status: string) {
+  if (status === "completed" || status === "success") return "完成";
+  if (status === "failed" || status === "error") return "失败";
+  if (status === "running") return "运行中";
+  return status || "未知";
+}
+
+function toolStatusStyle(status: string) {
+  if (status === "completed" || status === "success") return styles.toolStatusOk;
+  if (status === "failed" || status === "error") return styles.toolStatusError;
+  return styles.toolStatusPending;
+}
+
 const styles = StyleSheet.create({
   safe: {
     flex: 1,
@@ -261,6 +567,88 @@ const styles = StyleSheet.create({
   headerActions: {
     flexDirection: "row",
     alignItems: "center",
+  },
+  drawerRoot: {
+    flex: 1,
+    flexDirection: "row",
+  },
+  drawerBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(15, 23, 42, 0.38)",
+  },
+  drawerAnimated: {
+    width: 308,
+    maxWidth: "86%",
+    height: "100%",
+  },
+  drawer: {
+    width: "100%",
+    height: "100%",
+    backgroundColor: colors.surface,
+    borderRightWidth: 1,
+    borderRightColor: colors.border,
+    paddingHorizontal: 12,
+  },
+  drawerHeader: {
+    height: 56,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  drawerTitle: {
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  newSessionButton: {
+    height: 42,
+    borderRadius: 8,
+    backgroundColor: colors.primary,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 8,
+  },
+  newSessionText: {
+    color: "#fff",
+    fontWeight: "900",
+  },
+  drawerList: {
+    paddingVertical: 12,
+    gap: 8,
+  },
+  drawerItem: {
+    minHeight: 62,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  drawerItemActive: {
+    borderColor: colors.primary,
+    backgroundColor: "#eff6ff",
+  },
+  drawerItemCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  drawerItemTitle: {
+    color: colors.text,
+    fontWeight: "800",
+  },
+  drawerItemMeta: {
+    marginTop: 3,
+    color: colors.muted,
+    fontSize: 12,
+  },
+  emptyDrawer: {
+    color: colors.muted,
+    textAlign: "center",
+    paddingVertical: 20,
   },
   loading: {
     padding: 20,
@@ -366,6 +754,75 @@ const styles = StyleSheet.create({
     color: colors.muted,
     fontSize: 12,
   },
+  toolList: {
+    marginTop: 6,
+    gap: 6,
+  },
+  toolSummary: {
+    minHeight: 30,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+    paddingHorizontal: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  toolTitle: {
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  toolItem: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+    padding: 8,
+    gap: 4,
+  },
+  toolHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  toolName: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  toolStatus: {
+    overflow: "hidden",
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  toolStatusOk: {
+    backgroundColor: "#dcfce7",
+    color: colors.success,
+  },
+  toolStatusError: {
+    backgroundColor: "#fee2e2",
+    color: colors.danger,
+  },
+  toolStatusPending: {
+    backgroundColor: "#fef3c7",
+    color: colors.warning,
+  },
+  toolMeta: {
+    color: colors.muted,
+    fontSize: 11,
+  },
+  toolResult: {
+    color: colors.text,
+    fontSize: 12,
+    lineHeight: 17,
+  },
   running: {
     paddingHorizontal: 16,
     paddingVertical: 8,
@@ -380,6 +837,135 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "flex-end",
     gap: 10,
+  },
+  modelToolbar: {
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    backgroundColor: colors.surface,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  modelButton: {
+    minWidth: 0,
+    flex: 1,
+    height: 38,
+    borderRadius: 19,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  modelButtonText: {
+    minWidth: 0,
+    flex: 1,
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  toolbarIconButton: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modelPickerRoot: {
+    flex: 1,
+    justifyContent: "flex-end",
+  },
+  modelPickerBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(15, 23, 42, 0.32)",
+  },
+  modelPicker: {
+    maxHeight: "62%",
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+    backgroundColor: colors.surface,
+    borderTopWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+  },
+  modelPickerTitle: {
+    color: colors.text,
+    fontSize: 16,
+    fontWeight: "900",
+    marginBottom: 10,
+  },
+  modelPickerList: {
+    maxHeight: 360,
+  },
+  modelOption: {
+    minHeight: 48,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+  },
+  modelOptionSelected: {
+    backgroundColor: "#eff6ff",
+  },
+  modelOptionText: {
+    minWidth: 0,
+    flex: 1,
+    color: colors.text,
+    fontWeight: "800",
+  },
+  modelSelectedMark: {
+    color: colors.primary,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  attachments: {
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    backgroundColor: colors.surface,
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  attachmentChip: {
+    maxWidth: "48%",
+    height: 30,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+  },
+  attachmentText: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  addButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  addPressed: {
+    backgroundColor: colors.surfaceMuted,
   },
   input: {
     flex: 1,
@@ -413,6 +999,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 10,
   },
+  greetingTitle: {
+    fontSize: 34,
+    lineHeight: 40,
+    color: colors.text,
+    fontWeight: "900",
+  },
   emptyTitle: {
     fontSize: 20,
     color: colors.text,
@@ -435,4 +1027,3 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 });
-
