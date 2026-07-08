@@ -2,14 +2,15 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as DocumentPicker from "expo-document-picker";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { Bot, ChevronDown, ChevronRight, Menu, Plus, Send, Settings, Square, Trash2, X } from "lucide-react-native";
+import { Bot, Check, ChevronDown, ChevronRight, Menu, Plus, Send, Settings, Square, Trash2, X } from "lucide-react-native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Animated, FlatList, Image, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { completeSession, createMessage, createSession, deleteSession, getAgents, getCatalog, getSessions, isRunActive, messageContentWithAttachments, saveSession, selectedSessionKey, stopRun, titleFromMessages, uploadAttachment } from "../api/chat";
+import { SvgUri } from "react-native-svg";
+import { completeSession, createMessage, createSession, decideConnectorTask, deleteSession, getAgents, getCatalog, getPendingConnectorApprovals, getSessions, isRunActive, messageContentWithAttachments, saveSession, selectedSessionKey, stopRun, titleFromMessages, uploadAttachment } from "../api/chat";
 import { IconButton } from "../components/IconButton";
 import { colors } from "../theme/colors";
-import type { ChatAgent, ChatAttachment, ChatMessage, ChatSession, RootStackParamList, UserChannelCatalog } from "../types";
+import type { ChatAgent, ChatAttachment, ChatMessage, ChatSession, ConnectorApprovalTask, RootStackParamList, UserChannelCatalog } from "../types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "Chat">;
 
@@ -26,6 +27,8 @@ export function ChatScreen({ navigation, route }: Props) {
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [approvalTasks, setApprovalTasks] = useState<ConnectorApprovalTask[]>([]);
+  const [decidingTaskID, setDecidingTaskID] = useState("");
   const listRef = useRef<FlatList<ChatMessage> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -98,6 +101,36 @@ export function ChatScreen({ navigation, route }: Props) {
     }
   }, [sending, session?.latest_run?.status]);
 
+  const activeRunID = session?.latest_run?.id || "";
+  const hasApprovalRequiredToolCall = useMemo(
+    () => Boolean(session?.messages.some((message) => message.tool_calls?.some((toolCall) => toolCall.status === "approval_required"))),
+    [session?.messages]
+  );
+
+  useEffect(() => {
+    if (!activeRunID || (!isRunActive(session || undefined) && !hasApprovalRequiredToolCall)) {
+      setApprovalTasks([]);
+      return;
+    }
+    let cancelled = false;
+    const loadApprovals = async () => {
+      try {
+        const tasks = await getPendingConnectorApprovals(activeRunID);
+        if (!cancelled) {
+          setApprovalTasks(tasks);
+        }
+      } catch {
+        // Keep the last known approval tasks; the next poll can recover.
+      }
+    };
+    void loadApprovals();
+    const timer = setInterval(loadApprovals, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeRunID, hasApprovalRequiredToolCall, session?.latest_run?.status]);
+
   const missingConfig = useMemo(() => {
     if (!session) return "";
     if (session.run_mode !== "agent_group" && !session.model_name) return "请先选择模型。";
@@ -112,26 +145,29 @@ export function ChatScreen({ navigation, route }: Props) {
   const send = async () => {
     const content = prompt.trim();
     if (!session || (!content && attachments.length === 0) || sending) return;
-    const persistedSession = await ensurePersistedSession(session);
     if (missingConfig) {
       Alert.alert("配置不完整", missingConfig);
-      if (!persistedSession.model_name) {
+      if (!session.model_name) {
         setModelMenuOpen(true);
       } else {
-        navigation.navigate("SessionSettings", { sessionID: persistedSession.id });
+        const saved = await ensurePersistedSession(session);
+        navigation.navigate("SessionSettings", { sessionID: saved.id });
       }
       return;
     }
+    const alreadyPersisted = sessions.some((item) => item.id === session.id);
     const messageContent = messageContentWithAttachments(content, attachments);
     const userMessage = createMessage("user", messageContent);
     const nextSession = {
-      ...persistedSession,
-      title: persistedSession.title || titleFromMessages([...persistedSession.messages, userMessage]),
-      messages: [...persistedSession.messages, userMessage],
+      ...session,
+      title: session.title || titleFromMessages([...session.messages, userMessage]),
+      messages: [...session.messages, userMessage],
       updated_at: new Date().toISOString(),
     };
     setSession(nextSession);
-    setSessions((current) => upsertSession(current, nextSession));
+    if (alreadyPersisted) {
+      setSessions((current) => upsertSession(current, nextSession));
+    }
     setPrompt("");
     setAttachments([]);
     setSending(true);
@@ -142,6 +178,8 @@ export function ChatScreen({ navigation, route }: Props) {
       if (result.session) {
         setSession(result.session);
         setSessions((current) => upsertSession(current, result.session as ChatSession));
+        await AsyncStorage.setItem(selectedSessionKey, result.session.id);
+        navigation.setParams({ sessionID: result.session.id });
       } else if (result.message?.content) {
         const assistantMessage = {
           ...createMessage("assistant", result.message.content),
@@ -155,6 +193,8 @@ export function ChatScreen({ navigation, route }: Props) {
           setSessions((items) => upsertSession(items, next));
           return next;
         });
+        await AsyncStorage.setItem(selectedSessionKey, nextSession.id);
+        navigation.setParams({ sessionID: nextSession.id });
       } else {
         const sessions = await getSessions();
         const updated = sessions.find((item) => item.id === nextSession.id);
@@ -167,6 +207,9 @@ export function ChatScreen({ navigation, route }: Props) {
       }
       Alert.alert("发送失败", err instanceof Error ? err.message : "请求失败。");
       setSession(session);
+      if (alreadyPersisted) {
+        setSessions((current) => upsertSession(current, session));
+      }
       setPrompt(content);
       setAttachments(attachments);
     } finally {
@@ -299,6 +342,24 @@ export function ChatScreen({ navigation, route }: Props) {
     }
   };
 
+  const decideApproval = async (taskID: string, approved: boolean) => {
+    if (!taskID || decidingTaskID) return;
+    setDecidingTaskID(taskID);
+    try {
+      await decideConnectorTask(taskID, approved);
+      setApprovalTasks((current) => current.filter((task) => task.id !== taskID));
+      setSession((current) => current ? updateApprovalToolCallStatus(current, taskID, approved ? "running" : "error") : current);
+      const sessions = await getSessions();
+      const updated = session ? sessions.find((item) => item.id === session.id) : undefined;
+      if (updated) setSession(updated);
+      setSessions(sessions);
+    } catch (err) {
+      Alert.alert("审批失败", err instanceof Error ? err.message : "无法提交审批结果。");
+    } finally {
+      setDecidingTaskID("");
+    }
+  };
+
   if (loading && !session) {
     return <Text style={styles.loading}>正在加载...</Text>;
   }
@@ -330,7 +391,7 @@ export function ChatScreen({ navigation, route }: Props) {
               data={session.messages}
               keyExtractor={(item) => item.id}
               contentContainerStyle={session.messages.length ? styles.messages : styles.emptyMessages}
-              renderItem={({ item }) => <MessageBubble message={item} assistantName={assistantName} />}
+              renderItem={({ item }) => <MessageBubble message={item} assistantName={assistantName} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={decideApproval} />}
               ListEmptyComponent={<EmptyState hasCatalog={catalog.length > 0} />}
               ListFooterComponent={working ? <AssistantWorking status={workingStatus} assistantName={assistantName} /> : null}
               onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
@@ -463,6 +524,13 @@ function ModelPicker({
 
 function ModelIcon({ iconURL, size, muted }: { iconURL?: string; size: number; muted?: boolean }) {
   if (iconURL) {
+    if (isSVGURL(iconURL)) {
+      return (
+        <View style={[styles.modelIconImage, styles.modelIconSVG, { width: size, height: size, borderRadius: Math.max(4, size / 2) }]}>
+          <SvgUri uri={iconURL} width={size} height={size} />
+        </View>
+      );
+    }
     return <Image source={{ uri: iconURL }} style={[styles.modelIconImage, { width: size, height: size, borderRadius: Math.max(4, size / 2) }]} />;
   }
   return <Bot size={size} color={muted ? colors.muted : colors.primary} />;
@@ -536,14 +604,26 @@ function SessionDrawer({
   );
 }
 
-function MessageBubble({ message, assistantName }: { message: ChatMessage; assistantName: string }) {
+function MessageBubble({
+  message,
+  assistantName,
+  approvalTasks,
+  decidingTaskID,
+  onDecide,
+}: {
+  message: ChatMessage;
+  assistantName: string;
+  approvalTasks: ConnectorApprovalTask[];
+  decidingTaskID: string;
+  onDecide: (taskID: string, approved: boolean) => void;
+}) {
   const isUser = message.role === "user";
   return (
     <View style={[styles.bubbleRow, isUser && styles.bubbleRowUser]}>
       <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
         <Text style={[styles.bubbleRole, isUser && styles.userBubbleRole]}>{isUser ? "你" : assistantName}</Text>
         <Text selectable style={[styles.bubbleText, isUser && styles.userBubbleText]}>{message.content || " "}</Text>
-        {message.tool_calls?.length ? <ToolCallList calls={message.tool_calls} /> : null}
+        {message.tool_calls?.length ? <ToolCallList calls={message.tool_calls} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={onDecide} /> : null}
       </View>
     </View>
   );
@@ -602,26 +682,82 @@ function AssistantWorking({ status, assistantName }: { status: string; assistant
   );
 }
 
-function ToolCallList({ calls }: { calls: NonNullable<ChatMessage["tool_calls"]> }) {
-  const [expanded, setExpanded] = useState(false);
-  const Icon = expanded ? ChevronDown : ChevronRight;
+function ToolCallList({
+  calls,
+  approvalTasks,
+  decidingTaskID,
+  onDecide,
+}: {
+  calls: NonNullable<ChatMessage["tool_calls"]>;
+  approvalTasks: ConnectorApprovalTask[];
+  decidingTaskID: string;
+  onDecide: (taskID: string, approved: boolean) => void;
+}) {
   return (
     <View style={styles.toolList}>
+      {calls.map((call, index) => (
+        <ToolCallDetails
+          key={call.id || `${call.name}-${index}`}
+          call={call}
+          approvalTask={findConnectorApprovalTask(call, approvalTasks)}
+          decidingTaskID={decidingTaskID}
+          onDecide={onDecide}
+        />
+      ))}
+    </View>
+  );
+}
+
+function ToolCallDetails({
+  call,
+  approvalTask,
+  decidingTaskID,
+  onDecide,
+}: {
+  call: NonNullable<ChatMessage["tool_calls"]>[number];
+  approvalTask?: ConnectorApprovalTask;
+  decidingTaskID: string;
+  onDecide: (taskID: string, approved: boolean) => void;
+}) {
+  const shouldAutoOpen = call.status === "running" || call.status === "approval_required";
+  const [expanded, setExpanded] = useState(shouldAutoOpen);
+  const Icon = expanded ? ChevronDown : ChevronRight;
+
+  useEffect(() => {
+    setExpanded(shouldAutoOpen);
+  }, [call.id, shouldAutoOpen]);
+
+  return (
+    <View style={styles.toolItem}>
       <Pressable onPress={() => setExpanded((value) => !value)} style={styles.toolSummary}>
-        <Text style={styles.toolTitle}>工具调用 · {calls.length}</Text>
+        <Text numberOfLines={1} style={styles.toolTitle}>{toolTitle(call)}</Text>
+        <Text style={[styles.toolStatus, toolStatusStyle(call.status)]}>{toolStatusText(call.status)}</Text>
         <Icon size={15} color={colors.muted} />
       </Pressable>
+      {approvalTask ? (
+        <View style={styles.approvalActions}>
+          <Pressable disabled={Boolean(decidingTaskID)} onPress={() => onDecide(approvalTask.id, false)} style={({ pressed }) => [styles.rejectButton, pressed && styles.addPressed, Boolean(decidingTaskID) && styles.sendDisabled]}>
+            <X size={14} color={colors.danger} />
+            <Text style={styles.rejectText}>拒绝</Text>
+          </Pressable>
+          <Pressable disabled={Boolean(decidingTaskID)} onPress={() => onDecide(approvalTask.id, true)} style={({ pressed }) => [styles.approveButton, pressed && styles.sendPressed, Boolean(decidingTaskID) && styles.sendDisabled]}>
+            <Check size={14} color="#fff" />
+            <Text style={styles.approveText}>批准</Text>
+          </Pressable>
+        </View>
+      ) : null}
       {expanded ? (
-        calls.map((call, index) => (
-          <View key={call.id || `${call.name}-${index}`} style={styles.toolItem}>
-            <View style={styles.toolHeader}>
-              <Text numberOfLines={1} style={styles.toolName}>{call.name || call.tool || "tool"}</Text>
-              <Text style={[styles.toolStatus, toolStatusStyle(call.status)]}>{toolStatusText(call.status)}</Text>
-            </View>
-            {call.server || call.tool ? <Text numberOfLines={1} style={styles.toolMeta}>{[call.server, call.tool].filter(Boolean).join(" / ")}</Text> : null}
-            {call.result ? <Text numberOfLines={4} style={styles.toolResult}>{call.result}</Text> : null}
-          </View>
-        ))
+        <View style={styles.toolBody}>
+          {call.server || call.tool ? <Text numberOfLines={1} style={styles.toolMeta}>{[call.server, call.tool].filter(Boolean).join(" / ")}</Text> : null}
+          {call.arguments ? (
+            <>
+              <Text style={styles.toolSectionTitle}>参数</Text>
+              <Text selectable style={styles.toolCode}>{formatToolArguments(call.arguments)}</Text>
+            </>
+          ) : null}
+          <Text style={styles.toolSectionTitle}>结果</Text>
+          <Text selectable numberOfLines={8} style={styles.toolResult}>{call.result?.trim() || "暂无结果"}</Text>
+        </View>
       ) : null}
     </View>
   );
@@ -711,6 +847,11 @@ function modelIconURL(catalog: UserChannelCatalog[], modelName: string, channelI
   return "";
 }
 
+function isSVGURL(value: string) {
+  const clean = value.split("?")[0]?.split("#")[0]?.toLowerCase() || "";
+  return clean.endsWith(".svg") || value.toLowerCase().includes("image/svg+xml");
+}
+
 function runStatus(status: string) {
   if (status === "queued") return "任务排队中...";
   if (status === "loading_tools") return "正在加载工具...";
@@ -724,15 +865,117 @@ function upsertSession(sessions: ChatSession[], next: ChatSession) {
     : [next, ...sessions];
 }
 
+function updateApprovalToolCallStatus(session: ChatSession, taskID: string, status: string): ChatSession {
+  return {
+    ...session,
+    messages: session.messages.map((message) => ({
+      ...message,
+      tool_calls: (message.tool_calls || []).map((toolCall) =>
+        toolCall.status === "approval_required" && stringArgument(toolCall.arguments, "connector_task_id") === taskID
+          ? { ...toolCall, status }
+          : toolCall
+      ),
+    })),
+  };
+}
+
+function toolTitle(call: NonNullable<ChatMessage["tool_calls"]>[number]) {
+  const kind = builtinToolKind(call);
+  const path = stringArgument(call.arguments, "path");
+  const command = stringArgument(call.arguments, "command");
+  const query = stringArgument(call.arguments, "query");
+  const url = stringArgument(call.arguments, "url");
+  const target = kind === "command" ? command : kind === "search" ? query : kind === "fetch" ? url : path;
+  if (kind === "list") return `列出文件: ${target || "."}`;
+  if (kind === "read") return `读取文件: ${target || "."}`;
+  if (kind === "write") return `写入文件: ${target || "."}`;
+  if (kind === "replace") return `编辑文件: ${target || "."}`;
+  if (kind === "command") return `运行命令: ${target || "."}`;
+  if (kind === "search") return `搜索: ${target || "."}`;
+  if (kind === "fetch") return `读取网页: ${target || "."}`;
+  return `${call.server ? `${call.server}: ` : ""}${call.tool || call.name || "tool"}`;
+}
+
+function findConnectorApprovalTask(call: NonNullable<ChatMessage["tool_calls"]>[number], tasks: ConnectorApprovalTask[]) {
+  if (call.status !== "approval_required" || tasks.length === 0) {
+    return undefined;
+  }
+  return tasks.find((task) => connectorApprovalTaskMatchesToolCall(call, task));
+}
+
+function connectorApprovalTaskMatchesToolCall(call: NonNullable<ChatMessage["tool_calls"]>[number], task: ConnectorApprovalTask) {
+  if (task.id === stringArgument(call.arguments, "connector_task_id")) {
+    return true;
+  }
+  if (stringArgument(task.payload, "preview_tool_call_id") === call.id) {
+    return true;
+  }
+  const action = connectorActionForToolCall(call);
+  if (!action || task.action !== action) {
+    return false;
+  }
+  if (action === "run_command") {
+    return stringArgument(task.payload, "command") === stringArgument(call.arguments, "command");
+  }
+  return stringArgument(task.payload, "path") === stringArgument(call.arguments, "path");
+}
+
+function connectorActionForToolCall(call: NonNullable<ChatMessage["tool_calls"]>[number]) {
+  if (call.tool) {
+    return call.tool;
+  }
+  const kind = builtinToolKind(call);
+  if (kind === "list") return "list_files";
+  if (kind === "read") return "read_file";
+  if (kind === "write") return "write_file";
+  if (kind === "replace") return "replace_text";
+  if (kind === "command") return "run_command";
+  if (kind === "search") return "web_search";
+  if (kind === "fetch") return "web_fetch";
+  return "";
+}
+
+function builtinToolKind(call: NonNullable<ChatMessage["tool_calls"]>[number]) {
+  const name = (call.name || "").toLowerCase();
+  if (!name.startsWith("workspace_")) return "";
+  if (name.includes("workspace_list_files")) return "list";
+  if (name.includes("workspace_read_file")) return "read";
+  if (name.includes("workspace_write_file")) return "write";
+  if (name.includes("workspace_replace_text")) return "replace";
+  if (name.includes("workspace_run_command")) return "command";
+  if (name.includes("workspace_web_search")) return "search";
+  if (name.includes("workspace_web_fetch")) return "fetch";
+  return "";
+}
+
+function stringArgument(value: Record<string, unknown> | undefined, key: string) {
+  const item = value?.[key];
+  if (typeof item === "string") return item;
+  if (typeof item === "number" || typeof item === "boolean") return String(item);
+  return "";
+}
+
+function formatToolArguments(value: Record<string, unknown>) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 function toolStatusText(status: string) {
+  if (status === "ok") return "完成";
   if (status === "completed" || status === "success") return "完成";
   if (status === "failed" || status === "error") return "失败";
   if (status === "running") return "运行中";
+  if (status === "approval_required") return "待审批";
+  if (status === "missing") return "缺失";
+  if (status === "invalid_arguments") return "参数错误";
   return status || "未知";
 }
 
 function toolStatusStyle(status: string) {
-  if (status === "completed" || status === "success") return styles.toolStatusOk;
+  if (status === "ok" || status === "completed" || status === "success") return styles.toolStatusOk;
   if (status === "failed" || status === "error") return styles.toolStatusError;
   return styles.toolStatusPending;
 }
@@ -944,19 +1187,15 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   toolSummary: {
-    minHeight: 30,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.background,
-    paddingHorizontal: 8,
+    minHeight: 34,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
     gap: 8,
   },
   toolTitle: {
-    color: colors.muted,
+    flex: 1,
+    minWidth: 0,
+    color: colors.text,
     fontSize: 12,
     fontWeight: "800",
   },
@@ -965,8 +1204,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border,
     backgroundColor: colors.background,
-    padding: 8,
-    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    gap: 6,
   },
   toolHeader: {
     flexDirection: "row",
@@ -1003,10 +1243,61 @@ const styles = StyleSheet.create({
     color: colors.muted,
     fontSize: 11,
   },
+  toolBody: {
+    gap: 5,
+    paddingBottom: 2,
+  },
+  toolSectionTitle: {
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  toolCode: {
+    borderRadius: 8,
+    backgroundColor: colors.surfaceMuted,
+    padding: 8,
+    color: colors.text,
+    fontSize: 11,
+    lineHeight: 16,
+  },
   toolResult: {
     color: colors.text,
     fontSize: 12,
     lineHeight: 17,
+  },
+  approvalActions: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 8,
+  },
+  rejectButton: {
+    minHeight: 34,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.danger,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+  },
+  rejectText: {
+    color: colors.danger,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  approveButton: {
+    minHeight: 34,
+    borderRadius: 8,
+    backgroundColor: colors.primary,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+  },
+  approveText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "900",
   },
   workingRow: {
     alignItems: "flex-start",
@@ -1072,6 +1363,11 @@ const styles = StyleSheet.create({
   },
   modelIconImage: {
     backgroundColor: colors.surfaceMuted,
+  },
+  modelIconSVG: {
+    overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
   },
   toolbarIconButton: {
     width: 38,

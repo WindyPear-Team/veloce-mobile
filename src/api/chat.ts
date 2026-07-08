@@ -5,6 +5,7 @@ import type {
   ChatAgent,
   ChatAgentGroup,
   ChatAttachment,
+  ConnectorApprovalTask,
   ChatMessage,
   ChatRunMode,
   ChatSession,
@@ -62,6 +63,18 @@ export async function deleteSession(sessionID: string) {
 
 export async function stopRun(runID: string) {
   return apiRequest(`/user/advanced-chat/runs/${encodeURIComponent(runID)}/stop`, { method: "POST" });
+}
+
+export async function getPendingConnectorApprovals(runID: string) {
+  const tasks = await apiRequest<ConnectorApprovalTask[]>(`/user/advanced-chat/runs/${encodeURIComponent(runID)}/connector-tasks/pending`);
+  return Array.isArray(tasks) ? tasks : [];
+}
+
+export async function decideConnectorTask(taskID: string, approved: boolean) {
+  return apiRequest<{ ok?: boolean; status?: string }>(`/user/advanced-chat/connector-tasks/${encodeURIComponent(taskID)}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ approved }),
+  });
 }
 
 export async function uploadAttachment(asset: { uri: string; name?: string; mimeType?: string; size?: number }): Promise<ChatAttachment> {
@@ -134,6 +147,7 @@ export function createSession(input: Partial<ChatSession> = {}): ChatSession {
     title: input.title || "",
     messages: input.messages || [],
     run_mode: input.run_mode || "chat",
+    latest_run: input.latest_run,
     agent_id: input.agent_id || defaultAgentID,
     agent_group_id: input.agent_group_id,
     skill_ids: input.skill_ids || [],

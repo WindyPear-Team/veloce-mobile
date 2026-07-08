@@ -29,6 +29,17 @@ export interface ChatToolCall {
   result?: string;
 }
 
+export interface ConnectorApprovalTask {
+  id: string;
+  device_id: string;
+  device_name: string;
+  run_id: string;
+  action: string;
+  workspace_path: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
 export interface ChatContentPart {
   round?: number;
   content: string;
