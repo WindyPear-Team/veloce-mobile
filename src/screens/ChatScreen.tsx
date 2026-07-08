@@ -2,20 +2,21 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as DocumentPicker from "expo-document-picker";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { Bot, ChevronDown, ChevronRight, Menu, Plus, Send, Settings, Trash2, X } from "lucide-react-native";
+import { Bot, ChevronDown, ChevronRight, Menu, Plus, Send, Settings, Square, Trash2, X } from "lucide-react-native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Animated, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, Animated, FlatList, Image, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { completeSession, createMessage, createSession, deleteSession, getCatalog, getSessions, isRunActive, messageContentWithAttachments, saveSession, selectedSessionKey, stopRun, titleFromMessages, uploadAttachment } from "../api/chat";
+import { completeSession, createMessage, createSession, deleteSession, getAgents, getCatalog, getSessions, isRunActive, messageContentWithAttachments, saveSession, selectedSessionKey, stopRun, titleFromMessages, uploadAttachment } from "../api/chat";
 import { IconButton } from "../components/IconButton";
 import { colors } from "../theme/colors";
-import type { ChatAttachment, ChatMessage, ChatSession, RootStackParamList, UserChannelCatalog } from "../types";
+import type { ChatAgent, ChatAttachment, ChatMessage, ChatSession, RootStackParamList, UserChannelCatalog } from "../types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "Chat">;
 
 export function ChatScreen({ navigation, route }: Props) {
   const [session, setSession] = useState<ChatSession | null>(null);
   const [catalog, setCatalog] = useState<UserChannelCatalog[]>([]);
+  const [agents, setAgents] = useState<ChatAgent[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -23,18 +24,22 @@ export function ChatScreen({ navigation, route }: Props) {
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [uploading, setUploading] = useState(false);
   const listRef = useRef<FlatList<ChatMessage> | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [sessions, channels, storedID] = await Promise.all([
+      const [sessions, channels, agentItems, storedID] = await Promise.all([
         getSessions(),
         getCatalog().catch(() => []),
+        getAgents().catch(() => []),
         AsyncStorage.getItem(selectedSessionKey),
       ]);
       setCatalog(channels);
+      setAgents(agentItems);
       setSessions(sessions);
       const requestedID = route.params?.sessionID || "";
       const active = requestedID
@@ -87,6 +92,12 @@ export function ChatScreen({ navigation, route }: Props) {
     return () => clearInterval(timer);
   }, [session?.id, session?.latest_run?.status]);
 
+  useEffect(() => {
+    if (sending || isRunActive(session || undefined)) {
+      requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
+    }
+  }, [sending, session?.latest_run?.status]);
+
   const missingConfig = useMemo(() => {
     if (!session) return "";
     if (session.run_mode !== "agent_group" && !session.model_name) return "请先选择模型。";
@@ -95,6 +106,8 @@ export function ChatScreen({ navigation, route }: Props) {
     return "";
   }, [session]);
   const modelOptions = useMemo(() => Array.from(new Set(catalog.flatMap((item) => item.models || []))), [catalog]);
+  const assistantName = useMemo(() => agentName(agents, session?.agent_id), [agents, session?.agent_id]);
+  const selectedModelIconURL = useMemo(() => modelIconURL(catalog, session?.model_name || "", session?.user_channel_id), [catalog, session?.model_name, session?.user_channel_id]);
 
   const send = async () => {
     const content = prompt.trim();
@@ -118,11 +131,14 @@ export function ChatScreen({ navigation, route }: Props) {
       updated_at: new Date().toISOString(),
     };
     setSession(nextSession);
+    setSessions((current) => upsertSession(current, nextSession));
     setPrompt("");
     setAttachments([]);
     setSending(true);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     try {
-      const result = await completeSession(nextSession, nextSession.messages);
+      const result = await completeSession(nextSession, nextSession.messages, controller.signal);
       if (result.session) {
         setSession(result.session);
         setSessions((current) => upsertSession(current, result.session as ChatSession));
@@ -146,11 +162,17 @@ export function ChatScreen({ navigation, route }: Props) {
         setSessions(sessions);
       }
     } catch (err) {
+      if (isAbortError(err)) {
+        return;
+      }
       Alert.alert("发送失败", err instanceof Error ? err.message : "请求失败。");
       setSession(session);
       setPrompt(content);
       setAttachments(attachments);
     } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
       setSending(false);
     }
   };
@@ -204,7 +226,8 @@ export function ChatScreen({ navigation, route }: Props) {
 
   const updateSessionModel = async (modelName: string) => {
     if (!session) return;
-    const next = { ...session, model_name: modelName, updated_at: new Date().toISOString() };
+    const nextChannelID = channelIDForModel(catalog, modelName, session.user_channel_id);
+    const next = { ...session, model_name: modelName, user_channel_id: nextChannelID || session.user_channel_id, updated_at: new Date().toISOString() };
     setSession(next);
     setModelMenuOpen(false);
     if (sessions.some((item) => item.id === next.id)) {
@@ -250,20 +273,39 @@ export function ChatScreen({ navigation, route }: Props) {
   };
 
   const stop = async () => {
-    if (!session?.latest_run?.id) return;
+    if (!session || stopping) return;
+    setStopping(true);
     try {
-      await stopRun(session.latest_run.id);
+      const runID = await findActiveRunID(session.id, session.latest_run?.id, setSession, setSessions);
+      if (!runID) {
+        Alert.alert("暂时无法停止", "服务器还没有返回可停止的任务 ID，请稍后再试。");
+        return;
+      }
+      await stopRun(runID);
+      const controller = abortControllerRef.current;
+      if (controller && !controller.signal.aborted) {
+        controller.abort();
+      }
       const sessions = await getSessions();
       const updated = sessions.find((item) => item.id === session.id);
-      if (updated) setSession(updated);
+      if (updated) {
+        setSession(updated);
+        setSessions(sessions);
+      }
     } catch (err) {
       Alert.alert("停止失败", err instanceof Error ? err.message : "无法停止任务。");
+    } finally {
+      setStopping(false);
     }
   };
 
   if (loading && !session) {
     return <Text style={styles.loading}>正在加载...</Text>;
   }
+
+  const working = sending || stopping || isRunActive(session || undefined);
+  const sendDisabled = !working && !prompt.trim() && attachments.length === 0;
+  const workingStatus = stopping ? "正在停止..." : runStatus(session?.latest_run?.status_message || session?.latest_run?.status || "running");
 
   return (
     <SafeAreaView edges={["bottom"]} style={styles.safe}>
@@ -275,11 +317,6 @@ export function ChatScreen({ navigation, route }: Props) {
                 <Text numberOfLines={1} style={styles.sessionTitle}>{session.title || "新会话"}</Text>
                 <Text numberOfLines={1} style={styles.sessionMeta}>{modeLabel(session.run_mode)} · {session.model_name || "未选择模型"}</Text>
               </View>
-              {isRunActive(session) ? (
-                <Pressable onPress={stop} style={styles.stopButton}>
-                  <Text style={styles.stopText}>停止</Text>
-                </Pressable>
-              ) : null}
             </View>
 
             {missingConfig ? (
@@ -293,12 +330,11 @@ export function ChatScreen({ navigation, route }: Props) {
               data={session.messages}
               keyExtractor={(item) => item.id}
               contentContainerStyle={session.messages.length ? styles.messages : styles.emptyMessages}
-              renderItem={({ item }) => <MessageBubble message={item} />}
+              renderItem={({ item }) => <MessageBubble message={item} assistantName={assistantName} />}
               ListEmptyComponent={<EmptyState hasCatalog={catalog.length > 0} />}
+              ListFooterComponent={working ? <AssistantWorking status={workingStatus} assistantName={assistantName} /> : null}
               onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
             />
-
-            {isRunActive(session) ? <Text style={styles.running}>{runStatus(session.latest_run?.status_message || session.latest_run?.status || "running")}</Text> : null}
 
             {attachments.length > 0 ? (
               <View style={styles.attachments}>
@@ -312,10 +348,8 @@ export function ChatScreen({ navigation, route }: Props) {
             ) : null}
 
             <View style={styles.modelToolbar}>
-              <Pressable onPress={() => setModelMenuOpen(true)} style={({ pressed }) => [styles.modelButton, pressed && styles.addPressed]}>
-                <Bot size={17} color={colors.primary} />
-                <Text numberOfLines={1} style={styles.modelButtonText}>{session.model_name || "选择模型"}</Text>
-                <ChevronDown size={15} color={colors.muted} />
+              <Pressable accessibilityLabel={session.model_name || "选择模型"} onPress={() => setModelMenuOpen(true)} style={({ pressed }) => [styles.modelButton, pressed && styles.addPressed]}>
+                <ModelIcon iconURL={selectedModelIconURL} size={22} />
               </Pressable>
               <Pressable onPress={() => void ensurePersistedSession(session).then((saved) => navigation.navigate("SessionSettings", { sessionID: saved.id }))} style={({ pressed }) => [styles.toolbarIconButton, pressed && styles.addPressed]}>
                 <Settings size={18} color={colors.text} />
@@ -334,8 +368,8 @@ export function ChatScreen({ navigation, route }: Props) {
                 multiline
                 style={styles.input}
               />
-              <Pressable disabled={(!prompt.trim() && attachments.length === 0) || sending || isRunActive(session)} onPress={send} style={({ pressed }) => [styles.sendButton, ((!prompt.trim() && attachments.length === 0) || sending || isRunActive(session)) && styles.sendDisabled, pressed && styles.sendPressed]}>
-                <Send size={20} color="#fff" />
+              <Pressable disabled={sendDisabled} onPress={working ? stop : send} style={({ pressed }) => [styles.sendButton, working && styles.stopSendButton, sendDisabled && styles.sendDisabled, pressed && (working ? styles.stopSendPressed : styles.sendPressed)]}>
+                {working ? <Square size={18} color="#fff" fill="#fff" /> : <Send size={20} color="#fff" />}
               </Pressable>
             </View>
             <SessionDrawer
@@ -351,6 +385,8 @@ export function ChatScreen({ navigation, route }: Props) {
               open={modelMenuOpen}
               selectedModel={session.model_name || ""}
               models={modelOptions}
+              catalog={catalog}
+              channelID={session.user_channel_id}
               onClose={() => setModelMenuOpen(false)}
               onSelect={(model) => void updateSessionModel(model)}
             />
@@ -363,7 +399,34 @@ export function ChatScreen({ navigation, route }: Props) {
   );
 }
 
-function ModelPicker({ open, selectedModel, models, onClose, onSelect }: { open: boolean; selectedModel: string; models: string[]; onClose: () => void; onSelect: (model: string) => void }) {
+function ModelPicker({
+  open,
+  selectedModel,
+  models,
+  catalog,
+  channelID,
+  onClose,
+  onSelect,
+}: {
+  open: boolean;
+  selectedModel: string;
+  models: string[];
+  catalog: UserChannelCatalog[];
+  channelID?: number;
+  onClose: () => void;
+  onSelect: (model: string) => void;
+}) {
+  const selectedIndex = Math.max(0, models.findIndex((item) => item === selectedModel));
+  const listRef = useRef<FlatList<string> | null>(null);
+
+  useEffect(() => {
+    if (!open || selectedIndex < 0) return;
+    const timer = setTimeout(() => {
+      listRef.current?.scrollToIndex({ index: selectedIndex, animated: false, viewPosition: 0.35 });
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [open, selectedIndex]);
+
   return (
     <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
       <View style={styles.modelPickerRoot}>
@@ -371,14 +434,20 @@ function ModelPicker({ open, selectedModel, models, onClose, onSelect }: { open:
         <SafeAreaView edges={["bottom"]} style={styles.modelPicker}>
           <Text style={styles.modelPickerTitle}>选择模型</Text>
           <FlatList
+            ref={listRef}
             data={models}
             keyExtractor={(item) => item}
+            initialScrollIndex={models.length && selectedIndex > 0 ? selectedIndex : undefined}
+            getItemLayout={(_, index) => ({ length: 48, offset: 48 * index, index })}
+            onScrollToIndexFailed={(info) => {
+              setTimeout(() => listRef.current?.scrollToOffset({ offset: Math.max(0, info.averageItemLength * info.index - 80), animated: false }), 80);
+            }}
             style={styles.modelPickerList}
             renderItem={({ item }) => {
               const selected = item === selectedModel;
               return (
                 <Pressable onPress={() => onSelect(item)} style={({ pressed }) => [styles.modelOption, selected && styles.modelOptionSelected, pressed && styles.addPressed]}>
-                  <Bot size={17} color={selected ? colors.primary : colors.muted} />
+                  <ModelIcon iconURL={modelIconURL(catalog, item, channelID)} size={20} muted={!selected} />
                   <Text numberOfLines={1} style={styles.modelOptionText}>{item}</Text>
                   {selected ? <Text style={styles.modelSelectedMark}>已选</Text> : null}
                 </Pressable>
@@ -390,6 +459,13 @@ function ModelPicker({ open, selectedModel, models, onClose, onSelect }: { open:
       </View>
     </Modal>
   );
+}
+
+function ModelIcon({ iconURL, size, muted }: { iconURL?: string; size: number; muted?: boolean }) {
+  if (iconURL) {
+    return <Image source={{ uri: iconURL }} style={[styles.modelIconImage, { width: size, height: size, borderRadius: Math.max(4, size / 2) }]} />;
+  }
+  return <Bot size={size} color={muted ? colors.muted : colors.primary} />;
 }
 
 function SessionDrawer({
@@ -460,14 +536,67 @@ function SessionDrawer({
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({ message, assistantName }: { message: ChatMessage; assistantName: string }) {
   const isUser = message.role === "user";
   return (
     <View style={[styles.bubbleRow, isUser && styles.bubbleRowUser]}>
       <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
-        <Text style={[styles.bubbleRole, isUser && styles.userBubbleRole]}>{isUser ? "你" : "助理"}</Text>
+        <Text style={[styles.bubbleRole, isUser && styles.userBubbleRole]}>{isUser ? "你" : assistantName}</Text>
         <Text selectable style={[styles.bubbleText, isUser && styles.userBubbleText]}>{message.content || " "}</Text>
         {message.tool_calls?.length ? <ToolCallList calls={message.tool_calls} /> : null}
+      </View>
+    </View>
+  );
+}
+
+function AssistantWorking({ status, assistantName }: { status: string; assistantName: string }) {
+  const dots = useRef([new Animated.Value(0), new Animated.Value(0), new Animated.Value(0)]).current;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.stagger(
+        140,
+        dots.map((dot) => Animated.sequence([
+          Animated.timing(dot, {
+            toValue: 1,
+            duration: 420,
+            useNativeDriver: true,
+          }),
+          Animated.timing(dot, {
+            toValue: 0,
+            duration: 420,
+            useNativeDriver: true,
+          }),
+        ])),
+      ),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [dots]);
+
+  return (
+    <View style={styles.workingRow}>
+      <View style={[styles.bubble, styles.assistantBubble, styles.workingBubble]}>
+        <Text style={styles.bubbleRole}>{assistantName}</Text>
+        <View style={styles.workingLine}>
+          <Text style={styles.workingText}>{status}</Text>
+          <View style={styles.workingDots}>
+            {dots.map((dot, index) => (
+              <Animated.View
+                key={index}
+                style={[
+                  styles.workingDot,
+                  {
+                    opacity: dot.interpolate({ inputRange: [0, 1], outputRange: [0.35, 1] }),
+                    transform: [{
+                      translateY: dot.interpolate({ inputRange: [0, 1], outputRange: [0, -4] }),
+                    }],
+                  },
+                ]}
+              />
+            ))}
+          </View>
+        </View>
       </View>
     </View>
   );
@@ -524,10 +653,62 @@ function defaultSessionConfig(catalog: UserChannelCatalog[]): Partial<ChatSessio
   };
 }
 
+async function findActiveRunID(
+  sessionID: string,
+  currentRunID: string | undefined,
+  setSession: (session: ChatSession) => void,
+  setSessions: (sessions: ChatSession[]) => void,
+) {
+  if (currentRunID) {
+    return currentRunID;
+  }
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const sessions = await getSessions();
+    const updated = sessions.find((item) => item.id === sessionID);
+    setSessions(sessions);
+    if (updated) {
+      setSession(updated);
+      if (updated.latest_run?.id && isRunActive(updated)) {
+        return updated.latest_run.id;
+      }
+    }
+    await delay(350);
+  }
+  return "";
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function modeLabel(mode: string) {
   if (mode === "assistant") return "助理";
   if (mode === "agent_group") return "工作室";
   return "聊天";
+}
+
+function agentName(agents: ChatAgent[], id?: string) {
+  return agents.find((item) => item.id === (id || "default"))?.name || "默认助理";
+}
+
+function channelIDForModel(catalog: UserChannelCatalog[], modelName: string, currentChannelID?: number) {
+  const current = catalog.find((channel) => channel.id === currentChannelID);
+  if (current?.models?.includes(modelName)) {
+    return current.id;
+  }
+  return catalog.find((channel) => channel.models?.includes(modelName))?.id;
+}
+
+function modelIconURL(catalog: UserChannelCatalog[], modelName: string, channelID?: number) {
+  if (!modelName) return "";
+  const preferred = catalog.find((channel) => channel.id === channelID);
+  const preferredIcon = preferred?.model_icons?.[modelName];
+  if (preferredIcon) return preferredIcon;
+  for (const channel of catalog) {
+    const icon = channel.model_icons?.[modelName];
+    if (icon) return icon;
+  }
+  return "";
 }
 
 function runStatus(status: string) {
@@ -554,6 +735,10 @@ function toolStatusStyle(status: string) {
   if (status === "completed" || status === "success") return styles.toolStatusOk;
   if (status === "failed" || status === "error") return styles.toolStatusError;
   return styles.toolStatusPending;
+}
+
+function isAbortError(err: unknown) {
+  return err instanceof Error && (err.name === "AbortError" || err.message.toLowerCase().includes("aborted"));
 }
 
 const styles = StyleSheet.create({
@@ -823,6 +1008,33 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 17,
   },
+  workingRow: {
+    alignItems: "flex-start",
+  },
+  workingBubble: {
+    minWidth: 168,
+  },
+  workingLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  workingText: {
+    color: colors.primary,
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  workingDots: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  workingDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: colors.primary,
+  },
   running: {
     paddingHorizontal: 16,
     paddingVertical: 8,
@@ -846,27 +1058,20 @@ const styles = StyleSheet.create({
     paddingTop: 10,
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    justifyContent: "space-between",
   },
   modelButton: {
-    minWidth: 0,
-    flex: 1,
+    width: 38,
     height: 38,
     borderRadius: 19,
     borderWidth: 1,
     borderColor: colors.border,
     backgroundColor: colors.background,
-    paddingHorizontal: 12,
-    flexDirection: "row",
     alignItems: "center",
-    gap: 8,
+    justifyContent: "center",
   },
-  modelButtonText: {
-    minWidth: 0,
-    flex: 1,
-    color: colors.text,
-    fontSize: 13,
-    fontWeight: "800",
+  modelIconImage: {
+    backgroundColor: colors.surfaceMuted,
   },
   toolbarIconButton: {
     width: 38,
@@ -992,8 +1197,14 @@ const styles = StyleSheet.create({
   sendDisabled: {
     opacity: 0.45,
   },
+  stopSendButton: {
+    backgroundColor: colors.danger,
+  },
   sendPressed: {
     backgroundColor: colors.primaryDark,
+  },
+  stopSendPressed: {
+    backgroundColor: "#b91c1c",
   },
   emptyState: {
     alignItems: "center",

@@ -93,10 +93,11 @@ export async function uploadAttachment(asset: { uri: string; name?: string; mime
   };
 }
 
-export async function completeSession(session: ChatSession, messages: ChatMessage[]) {
+export async function completeSession(session: ChatSession, messages: ChatMessage[], signal?: AbortSignal) {
   const isStudio = session.run_mode === "agent_group";
   return apiRequest<{ session?: ChatSession; message?: ChatMessage; tool_call_details?: unknown[] }>("/user/advanced-chat/completions", {
     method: "POST",
+    signal,
     body: JSON.stringify({
       session_id: session.id,
       title: session.title || titleFromMessages(messages),

@@ -15,6 +15,7 @@ export interface UserChannelCatalog {
   id: number;
   name: string;
   models: string[];
+  model_icons?: Record<string, string>;
 }
 
 export interface ChatToolCall {

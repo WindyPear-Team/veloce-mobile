@@ -66,7 +66,7 @@ export function SessionSettingDetailScreen({ navigation, route }: DetailProps) {
       )) : null}
 
       {section === "agent" ? state.agents.map((agent) => (
-        <SelectRow key={agent.id} title={agent.name || agent.id} subtitle={agent.default_model || "助理"} selected={(session.agent_id || "default") === agent.id} onPress={() => update({ agent_id: agent.id })} />
+        <SelectRow key={agent.id} title={agent.name || agent.id} subtitle={agent.default_model || "助理"} selected={(session.agent_id || "default") === agent.id} onPress={() => update(agentSelectionPatch(agent, state.catalog, session.model_name))} />
       )) : null}
 
       {section === "studio" ? state.groups.map((group) => (
@@ -272,6 +272,15 @@ function updateMode(session: ChatSession, mode: ChatRunMode, update: (patch: Par
     ...(mode === "agent_group" ? { agent_id: undefined, agent_group_id: session.agent_group_id || "" } : { agent_id: session.agent_id || "default", agent_group_id: "" }),
     ...(mode === "chat" ? { connector_device_id: undefined, connector_workspace_path: undefined, connector_auto_approve: false, connector_command_prefixes: [] } : {}),
   });
+}
+
+function agentSelectionPatch(agent: ChatAgent, catalog: UserChannelCatalog[], currentModel?: string): Partial<ChatSession> {
+  const channel = agent.user_channel_id ? catalog.find((item) => item.id === agent.user_channel_id) : undefined;
+  return {
+    agent_id: agent.id,
+    user_channel_id: agent.user_channel_id || undefined,
+    model_name: agent.default_model || channel?.models?.[0] || currentModel || "",
+  };
 }
 
 function toggleID(values: string[], id: string) {
