@@ -1,5 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useFocusEffect } from "@react-navigation/native";
+import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { MoreHorizontal, Plus } from "lucide-react-native";
 import { useCallback, useState } from "react";
@@ -7,10 +8,11 @@ import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-nati
 import { createSession, deleteSession, getSessions, saveSession, selectedSessionKey, titleFromMessages } from "../api/chat";
 import { AppButton } from "../components/Button";
 import { IconButton } from "../components/IconButton";
+import { SwipeableSessionItem } from "../components/SwipeableSessionItem";
 import { colors } from "../theme/colors";
-import type { ChatSession, RootStackParamList } from "../types";
+import type { ChatSession, MainTabParamList, RootStackParamList } from "../types";
 
-type Props = NativeStackScreenProps<RootStackParamList, "Sessions">;
+type Props = BottomTabScreenProps<MainTabParamList, "Sessions"> & Pick<NativeStackScreenProps<RootStackParamList>, "navigation">;
 
 export function SessionListScreen({ navigation }: Props) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -82,18 +84,20 @@ export function SessionListScreen({ navigation }: Props) {
       {sessions.map((session) => {
         const selected = session.id === activeID;
         return (
-          <Pressable
+          <SwipeableSessionItem
             key={session.id}
             onPress={() => void select(session.id)}
             onLongPress={() => showActions(session)}
-            style={[styles.item, selected && styles.selected]}
+            onSettings={() => navigation.navigate("SessionSettings", { sessionID: session.id })}
+            onDelete={() => void remove(session.id)}
+            contentStyle={[styles.item, selected && styles.selected]}
           >
             <View style={styles.itemCopy}>
               <Text numberOfLines={1} style={styles.title}>{session.title || titleFromMessages(session.messages)}</Text>
               <Text numberOfLines={1} style={styles.subtitle}>{session.messages.length} 条消息 · {modeLabel(session.run_mode)} · 长按设置</Text>
             </View>
             <IconButton icon={MoreHorizontal} label="会话操作" onPress={() => showActions(session)} />
-          </Pressable>
+          </SwipeableSessionItem>
         );
       })}
     </ScrollView>

@@ -1,3 +1,4 @@
+import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { useContext, useEffect, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
@@ -6,9 +7,9 @@ import { clearAuthToken, defaultServerURL, getAuthToken, getServerURL, normalize
 import { AppButton } from "../components/Button";
 import { Field } from "../components/Field";
 import { colors } from "../theme/colors";
-import type { RootStackParamList } from "../types";
+import type { MainTabParamList, RootStackParamList } from "../types";
 
-type Props = NativeStackScreenProps<RootStackParamList, "Settings">;
+type Props = BottomTabScreenProps<MainTabParamList, "Settings"> & Pick<NativeStackScreenProps<RootStackParamList>, "navigation">;
 
 export function ClientSettingsScreen({ navigation }: Props) {
   const auth = useContext(AuthContext);
@@ -140,4 +141,3 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
 });
-

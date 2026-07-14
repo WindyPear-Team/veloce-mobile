@@ -7,14 +7,39 @@
     "scheme": "windypear",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "允许 WindyPear 访问照片以上传到聊天",
+          "cameraPermission": "允许 WindyPear 使用相机拍照并上传到聊天"
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#2563eb"
+        }
+      ]
+    ],
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "允许 WindyPear 使用麦克风进行语音输入"
+      }
     },
     "android": {
       "softwareKeyboardLayoutMode": "resize",
+      "permissions": [
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.RECORD_AUDIO"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#0f172a"
-      }
+      },
+      "package": "com.anonymous.windypearmobile"
     },
     "web": {
       "bundler": "metro"

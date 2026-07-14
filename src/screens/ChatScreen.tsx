@@ -1,8 +1,14 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useNetInfo } from "@react-native-community/netinfo";
+import * as Clipboard from "expo-clipboard";
 import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
+import * as ImagePicker from "expo-image-picker";
 import { useFocusEffect } from "@react-navigation/native";
+import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { Bot, Check, ChevronDown, ChevronRight, Menu, Plus, Send, Settings, Square, Trash2, X } from "lucide-react-native";
+import Voice from "@react-native-voice/voice";
+import { Bot, Camera, Check, ChevronDown, ChevronRight, ClipboardPaste, Image as ImageIcon, Menu, Mic, Plus, Send, Settings, Square, WifiOff, X } from "lucide-react-native";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Animated, FlatList, Image, Keyboard, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
@@ -10,19 +16,22 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { SvgUri } from "react-native-svg";
 import { completeSession, createMessage, createSession, decideConnectorTask, deleteSession, getAgents, getCatalog, getPendingConnectorApprovals, getSessions, isRunActive, messageContentWithAttachments, saveSession, selectedSessionKey, stopRun, titleFromMessages, uploadAttachment } from "../api/chat";
 import { IconButton } from "../components/IconButton";
+import { SwipeableSessionItem } from "../components/SwipeableSessionItem";
 import { colors } from "../theme/colors";
-import type { ChatAgent, ChatAttachment, ChatMessage, ChatSession, ConnectorApprovalTask, RootStackParamList, UserChannelCatalog } from "../types";
+import type { ChatAgent, ChatAttachment, ChatMessage, ChatSession, ConnectorApprovalTask, MainTabParamList, RootStackParamList, UserChannelCatalog } from "../types";
 
-type Props = NativeStackScreenProps<RootStackParamList, "Chat">;
+type Props = BottomTabScreenProps<MainTabParamList, "Chat"> & Pick<NativeStackScreenProps<RootStackParamList>, "navigation">;
 
 export function ChatScreen({ navigation, route }: Props) {
   const insets = useSafeAreaInsets();
+  const netInfo = useNetInfo();
   const [session, setSession] = useState<ChatSession | null>(null);
   const [catalog, setCatalog] = useState<UserChannelCatalog[]>([]);
   const [agents, setAgents] = useState<ChatAgent[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [loading, setLoading] = useState(true);
@@ -32,8 +41,13 @@ export function ChatScreen({ navigation, route }: Props) {
   const [approvalTasks, setApprovalTasks] = useState<ConnectorApprovalTask[]>([]);
   const [decidingTaskID, setDecidingTaskID] = useState("");
   const [keyboardSpacer, setKeyboardSpacer] = useState(0);
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [sendError, setSendError] = useState("");
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const listRef = useRef<FlatList<ChatMessage> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const voicePromptBaseRef = useRef("");
+  const isOnline = netInfo.isConnected !== false && netInfo.isInternetReachable !== false;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -72,12 +86,33 @@ export function ChatScreen({ navigation, route }: Props) {
     navigation.setOptions({
       headerLeft: () => <IconButton icon={Menu} label="会话" onPress={() => setDrawerOpen(true)} />,
       headerRight: () => (
-        <View style={styles.headerActions}>
-          <IconButton icon={Settings} label="设置" onPress={() => navigation.navigate("Settings")} />
-        </View>
+        null
       ),
     });
   }, [navigation]);
+
+  useEffect(() => {
+    Voice.onSpeechResults = (event) => {
+      const text = event.value?.[0]?.trim();
+      if (text) {
+        setPrompt(`${voicePromptBaseRef.current}${text}`);
+      }
+    };
+    Voice.onSpeechPartialResults = (event) => {
+      const text = event.value?.[0]?.trim();
+      if (text) {
+        setPrompt(`${voicePromptBaseRef.current}${text}`);
+      }
+    };
+    Voice.onSpeechError = () => {
+      setVoiceActive(false);
+      Alert.alert("语音输入不可用", "请检查麦克风权限，并使用开发构建或正式安装包。");
+    };
+    Voice.onSpeechEnd = () => setVoiceActive(false);
+    return () => {
+      void Voice.destroy().finally(Voice.removeAllListeners);
+    };
+  }, []);
 
   useEffect(() => {
     if (Platform.OS !== "android") {
@@ -113,16 +148,16 @@ export function ChatScreen({ navigation, route }: Props) {
   }, [session?.id, session?.latest_run?.status]);
 
   useEffect(() => {
-    if (sending || isRunActive(session || undefined)) {
+    if ((sending || isRunActive(session || undefined)) && !showJumpToLatest) {
       requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
     }
-  }, [sending, session?.latest_run?.status]);
+  }, [sending, session?.latest_run?.status, showJumpToLatest]);
 
   useEffect(() => {
-    if (session?.messages.length) {
+    if (session?.messages.length && !showJumpToLatest) {
       requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
     }
-  }, [session?.messages]);
+  }, [session?.messages, showJumpToLatest]);
 
   const activeRunID = session?.latest_run?.id || "";
   const hasApprovalRequiredToolCall = useMemo(
@@ -168,6 +203,10 @@ export function ChatScreen({ navigation, route }: Props) {
   const send = async () => {
     const content = prompt.trim();
     if (!session || (!content && attachments.length === 0) || sending) return;
+    if (!isOnline) {
+      setSendError("当前离线，恢复网络后可重试。");
+      return;
+    }
     if (missingConfig) {
       Alert.alert("配置不完整", missingConfig);
       if (!session.model_name) {
@@ -193,6 +232,7 @@ export function ChatScreen({ navigation, route }: Props) {
     }
     setPrompt("");
     setAttachments([]);
+    setSendError("");
     setSending(true);
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -229,6 +269,7 @@ export function ChatScreen({ navigation, route }: Props) {
         return;
       }
       Alert.alert("发送失败", err instanceof Error ? err.message : "请求失败。");
+      setSendError("发送失败，点击重试。");
       setSession(session);
       if (alreadyPersisted) {
         setSessions((current) => upsertSession(current, session));
@@ -243,15 +284,13 @@ export function ChatScreen({ navigation, route }: Props) {
     }
   };
 
-  const pickAttachments = async () => {
+  const uploadAssets = async (assets: Array<{ uri: string; name?: string | null; mimeType?: string | null; size?: number | null }>) => {
     if (uploading) return;
     setUploading(true);
     try {
-      const result = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true });
-      if (result.canceled) return;
       const next: ChatAttachment[] = [];
-      for (const asset of result.assets.slice(0, Math.max(1, 8 - attachments.length))) {
-        next.push(await uploadAttachment({ uri: asset.uri, name: asset.name, mimeType: asset.mimeType, size: asset.size }));
+      for (const asset of assets.slice(0, Math.max(1, 8 - attachments.length))) {
+        next.push(await uploadAttachment({ uri: asset.uri, name: asset.name || undefined, mimeType: asset.mimeType || undefined, size: asset.size || undefined }));
       }
       if (next.length) {
         setAttachments((current) => [...current, ...next].slice(0, 8));
@@ -260,6 +299,65 @@ export function ChatScreen({ navigation, route }: Props) {
       Alert.alert("上传失败", err instanceof Error ? err.message : "无法上传附件。");
     } finally {
       setUploading(false);
+    }
+  };
+
+  const pickAttachments = async () => {
+    const result = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true });
+    if (!result.canceled) {
+      await uploadAssets(result.assets);
+    }
+    setAttachmentMenuOpen(false);
+  };
+
+  const pickPhotoLibrary = async () => {
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("需要照片权限", "请允许访问相册后再选择图片。");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], allowsMultipleSelection: true, selectionLimit: Math.max(1, 8 - attachments.length), quality: 0.92 });
+      if (!result.canceled) {
+        await uploadAssets(result.assets.map((asset) => ({ uri: asset.uri, name: asset.fileName, mimeType: asset.mimeType, size: asset.fileSize })));
+      }
+    } finally {
+      setAttachmentMenuOpen(false);
+    }
+  };
+
+  const takePhoto = async () => {
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("需要相机权限", "请允许使用相机后再拍照上传。");
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.92 });
+      if (!result.canceled) {
+        const asset = result.assets[0];
+        await uploadAssets([{ uri: asset.uri, name: asset.fileName, mimeType: asset.mimeType, size: asset.fileSize }]);
+      }
+    } finally {
+      setAttachmentMenuOpen(false);
+    }
+  };
+
+  const pasteClipboardImage = async () => {
+    try {
+      const image = await Clipboard.getImageAsync({ format: "png" });
+      if (!image?.data || !FileSystem.cacheDirectory) {
+        Alert.alert("没有可粘贴的图片", "请先在其他应用中复制一张图片。");
+        return;
+      }
+      const base64 = image.data.replace(/^data:image\/png;base64,/, "");
+      const uri = `${FileSystem.cacheDirectory}clipboard-${Date.now()}.png`;
+      await FileSystem.writeAsStringAsync(uri, base64, { encoding: FileSystem.EncodingType.Base64 });
+      await uploadAssets([{ uri, name: "clipboard-image.png", mimeType: "image/png" }]);
+    } catch (err) {
+      Alert.alert("粘贴失败", err instanceof Error ? err.message : "无法读取剪贴板图片。");
+    } finally {
+      setAttachmentMenuOpen(false);
     }
   };
 
@@ -383,6 +481,49 @@ export function ChatScreen({ navigation, route }: Props) {
     }
   };
 
+  const toggleVoiceInput = async () => {
+    if (voiceActive) {
+      await Voice.stop();
+      setVoiceActive(false);
+      return;
+    }
+    try {
+      const available = await Voice.isAvailable();
+      if (!available) {
+        Alert.alert("语音输入不可用", "当前设备没有可用的语音识别服务。");
+        return;
+      }
+      voicePromptBaseRef.current = prompt && !/\s$/.test(prompt) ? `${prompt} ` : prompt;
+      await Voice.start("zh-CN");
+      setVoiceActive(true);
+    } catch (err) {
+      Alert.alert("无法启动语音输入", err instanceof Error ? err.message : "请检查麦克风权限。");
+    }
+  };
+
+  const showMessageActions = (message: ChatMessage) => {
+    const content = messageDisplayContent(message, session?.latest_run).trim();
+    Alert.alert(message.role === "user" ? "我的消息" : "助理消息", "选择操作", [
+      { text: "取消", style: "cancel" },
+      { text: "复制", onPress: () => void Clipboard.setStringAsync(content) },
+      { text: "引用", onPress: () => setPrompt(`对于你所说的“${content.slice(0, 12000)}”，`) },
+      ...(message.role === "user" ? [{ text: "编辑", onPress: () => setPrompt(content) }] : []),
+      {
+        text: "删除",
+        style: "destructive" as const,
+        onPress: () => {
+          if (!session) return;
+          const next = { ...session, messages: session.messages.filter((item) => item.id !== message.id), updated_at: new Date().toISOString() };
+          setSession(next);
+          setSessions((current) => upsertSession(current, next));
+          if (sessions.some((item) => item.id === next.id)) {
+            void saveSession(next).catch(() => Alert.alert("删除失败", "无法保存会话变更。"));
+          }
+        },
+      },
+    ]);
+  };
+
   if (loading && !session) {
     return <Text style={styles.loading}>正在加载...</Text>;
   }
@@ -415,15 +556,23 @@ export function ChatScreen({ navigation, route }: Props) {
               data={session.messages}
               keyExtractor={(item) => item.id}
               contentContainerStyle={session.messages.length ? styles.messages : styles.emptyMessages}
-              renderItem={({ item }) => <MessageBubble message={item} activeRun={session.latest_run} assistantName={assistantName} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={decideApproval} />}
+              renderItem={({ item }) => <MessageBubble message={item} activeRun={session.latest_run} assistantName={assistantName} approvalTasks={approvalTasks} decidingTaskID={decidingTaskID} onDecide={decideApproval} onLongPress={showMessageActions} />}
+              onScroll={(event) => {
+                const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+                setShowJumpToLatest(contentSize.height - (contentOffset.y + layoutMeasurement.height) > 72);
+              }}
+              scrollEventThrottle={16}
               ListEmptyComponent={<EmptyState hasCatalog={catalog.length > 0} />}
               ListFooterComponent={working ? <AssistantWorking status={workingStatus} assistantName={assistantName} /> : null}
             />
-            {session.messages.length > 0 ? (
-              <Pressable onPress={() => listRef.current?.scrollToEnd({ animated: true })} style={({ pressed }) => [styles.latestButton, { bottom: latestButtonBottom }, pressed && styles.sendPressed]}>
+            {showJumpToLatest && session.messages.length > 0 ? (
+              <Pressable onPress={() => { setShowJumpToLatest(false); listRef.current?.scrollToEnd({ animated: true }); }} style={({ pressed }) => [styles.latestButton, { bottom: latestButtonBottom }, pressed && styles.sendPressed]}>
                 <ChevronDown size={22} color="#fff" />
               </Pressable>
             ) : null}
+
+            {!isOnline ? <View style={styles.offlineNotice}><WifiOff size={15} color={colors.warning} /><Text style={styles.offlineNoticeText}>当前离线，恢复网络后可继续发送</Text></View> : null}
+            {sendError ? <Pressable disabled={!isOnline || sending} onPress={() => void send()} style={styles.retryNotice}><Text style={styles.retryNoticeText}>{sendError}</Text><Text style={styles.retryAction}>重试</Text></Pressable> : null}
 
             {attachments.length > 0 ? (
               <View style={styles.attachments}>
@@ -446,8 +595,11 @@ export function ChatScreen({ navigation, route }: Props) {
             </View>
 
             <View style={styles.composer}>
-              <Pressable disabled={uploading} onPress={pickAttachments} style={({ pressed }) => [styles.addButton, pressed && styles.addPressed, uploading && styles.sendDisabled]}>
+              <Pressable disabled={uploading} onPress={() => setAttachmentMenuOpen(true)} style={({ pressed }) => [styles.addButton, pressed && styles.addPressed, uploading && styles.sendDisabled]}>
                 <Plus size={22} color={colors.primary} />
+              </Pressable>
+              <Pressable onPress={() => void toggleVoiceInput()} style={({ pressed }) => [styles.voiceButton, voiceActive && styles.voiceButtonActive, pressed && styles.addPressed]}>
+                <Mic size={19} color={voiceActive ? colors.primary : colors.muted} />
               </Pressable>
               <TextInput
                 value={prompt}
@@ -470,6 +622,11 @@ export function ChatScreen({ navigation, route }: Props) {
               onCreate={() => void createNewSession()}
               onSelect={(id) => void selectSession(id)}
               onLongPress={showSessionActions}
+              onSettings={(target) => {
+                setDrawerOpen(false);
+                navigation.navigate("SessionSettings", { sessionID: target.id });
+              }}
+              onDelete={(target) => void removeSession(target.id)}
             />
             <ModelPicker
               open={modelMenuOpen}
@@ -479,6 +636,15 @@ export function ChatScreen({ navigation, route }: Props) {
               channelID={session.user_channel_id}
               onClose={() => setModelMenuOpen(false)}
               onSelect={(model) => void updateSessionModel(model)}
+            />
+            <AttachmentPicker
+              open={attachmentMenuOpen}
+              uploading={uploading}
+              onClose={() => setAttachmentMenuOpen(false)}
+              onFiles={() => void pickAttachments()}
+              onLibrary={() => void pickPhotoLibrary()}
+              onCamera={() => void takePhoto()}
+              onPaste={() => void pasteClipboardImage()}
             />
           </>
         ) : (
@@ -551,6 +717,48 @@ function ModelPicker({
   );
 }
 
+function AttachmentPicker({
+  open,
+  uploading,
+  onClose,
+  onFiles,
+  onLibrary,
+  onCamera,
+  onPaste,
+}: {
+  open: boolean;
+  uploading: boolean;
+  onClose: () => void;
+  onFiles: () => void;
+  onLibrary: () => void;
+  onCamera: () => void;
+  onPaste: () => void;
+}) {
+  const options = [
+    { label: "选择文件", icon: Plus, onPress: onFiles },
+    { label: "从相册选择", icon: ImageIcon, onPress: onLibrary },
+    { label: "拍照", icon: Camera, onPress: onCamera },
+    { label: "粘贴图片", icon: ClipboardPaste, onPress: onPaste },
+  ];
+  return (
+    <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.modelPickerRoot}>
+        <Pressable style={styles.modelPickerBackdrop} onPress={onClose} />
+        <SafeAreaView edges={["bottom"]} style={styles.attachmentPicker}>
+          <Text style={styles.modelPickerTitle}>添加附件</Text>
+          {options.map((option) => (
+            <Pressable key={option.label} disabled={uploading} onPress={option.onPress} style={({ pressed }) => [styles.attachmentOption, pressed && styles.addPressed, uploading && styles.sendDisabled]}>
+              <option.icon size={19} color={colors.primary} />
+              <Text style={styles.attachmentOptionText}>{uploading ? "上传中..." : option.label}</Text>
+              <ChevronRight size={18} color={colors.muted} />
+            </Pressable>
+          ))}
+        </SafeAreaView>
+      </View>
+    </Modal>
+  );
+}
+
 function ModelIcon({ iconURL, size, muted }: { iconURL?: string; size: number; muted?: boolean }) {
   if (iconURL) {
     if (isSVGURL(iconURL)) {
@@ -573,6 +781,8 @@ function SessionDrawer({
   onCreate,
   onSelect,
   onLongPress,
+  onSettings,
+  onDelete,
 }: {
   open: boolean;
   sessions: ChatSession[];
@@ -581,21 +791,36 @@ function SessionDrawer({
   onCreate: () => void;
   onSelect: (sessionID: string) => void;
   onLongPress: (session: ChatSession) => void;
+  onSettings: (session: ChatSession) => void;
+  onDelete: (session: ChatSession) => void;
 }) {
   const slide = useRef(new Animated.Value(-320)).current;
+  const [visible, setVisible] = useState(open);
 
   useEffect(() => {
-    if (!open) return;
-    slide.setValue(-320);
-    Animated.timing(slide, {
-      toValue: 0,
-      duration: 180,
-      useNativeDriver: true,
-    }).start();
+    slide.stopAnimation();
+    if (open) {
+      setVisible(true);
+      slide.setValue(-320);
+      const animation = Animated.timing(slide, { toValue: 0, duration: 180, useNativeDriver: true });
+      const frame = requestAnimationFrame(() => animation.start());
+      return () => {
+        cancelAnimationFrame(frame);
+        animation.stop();
+      };
+    }
+    if (!visible) return;
+    const animation = Animated.timing(slide, { toValue: -320, duration: 160, useNativeDriver: true });
+    animation.start(({ finished }) => {
+      if (finished) setVisible(false);
+    });
+    return () => animation.stop();
   }, [open, slide]);
 
+  if (!visible) return null;
+
   return (
-    <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
+    <Modal visible transparent animationType="none" onRequestClose={onClose}>
       <View style={styles.drawerRoot}>
         <Pressable style={styles.drawerBackdrop} onPress={onClose} />
         <Animated.View style={[styles.drawerAnimated, { transform: [{ translateX: slide }] }]}>
@@ -615,13 +840,18 @@ function SessionDrawer({
             renderItem={({ item }) => {
               const selected = item.id === activeID;
               return (
-                <Pressable onPress={() => onSelect(item.id)} onLongPress={() => onLongPress(item)} style={[styles.drawerItem, selected && styles.drawerItemActive]}>
+                <SwipeableSessionItem
+                  onPress={() => onSelect(item.id)}
+                  onLongPress={() => onLongPress(item)}
+                  onSettings={() => onSettings(item)}
+                  onDelete={() => onDelete(item)}
+                  contentStyle={[styles.drawerItem, selected && styles.drawerItemActive]}
+                >
                   <View style={styles.drawerItemCopy}>
                     <Text numberOfLines={1} style={styles.drawerItemTitle}>{item.title || titleFromMessages(item.messages)}</Text>
                     <Text numberOfLines={1} style={styles.drawerItemMeta}>{item.messages.length} 条 · {modeLabel(item.run_mode)}</Text>
                   </View>
-                  <Trash2 size={16} color={colors.muted} />
-                </Pressable>
+                </SwipeableSessionItem>
               );
             }}
             ListEmptyComponent={<Text style={styles.emptyDrawer}>还没有会话</Text>}
@@ -640,6 +870,7 @@ function MessageBubble({
   approvalTasks,
   decidingTaskID,
   onDecide,
+  onLongPress,
 }: {
   message: ChatMessage;
   activeRun?: ChatSession["latest_run"];
@@ -647,13 +878,14 @@ function MessageBubble({
   approvalTasks: ConnectorApprovalTask[];
   decidingTaskID: string;
   onDecide: (taskID: string, approved: boolean) => void;
+  onLongPress: (message: ChatMessage) => void;
 }) {
   const isUser = message.role === "user";
   const parts = messageDisplayParts(message, activeRun);
   const toolCallsByRound = groupToolCallsByRound(message.tool_calls || []);
   const rounds = orderedMessageRounds(parts, toolCallsByRound);
   return (
-    <View style={[styles.bubbleRow, isUser && styles.bubbleRowUser]}>
+    <Pressable delayLongPress={450} onLongPress={() => onLongPress(message)} style={[styles.bubbleRow, isUser && styles.bubbleRowUser]}>
       <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
         <Text style={[styles.bubbleRole, isUser && styles.userBubbleRole]}>{isUser ? "你" : assistantName}</Text>
         {isUser ? (
@@ -673,7 +905,7 @@ function MessageBubble({
           })
         )}
       </View>
-    </View>
+    </Pressable>
   );
 }
 
@@ -1284,6 +1516,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
     borderColor: colors.border,
+    backgroundColor: colors.surface,
     paddingHorizontal: 12,
     paddingVertical: 9,
     flexDirection: "row",
@@ -1705,6 +1938,30 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 14,
   },
+  attachmentPicker: {
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+    backgroundColor: colors.surface,
+    borderTopWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 10,
+  },
+  attachmentOption: {
+    minHeight: 52,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  attachmentOptionText: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 15,
+    fontWeight: "800",
+  },
   modelPickerTitle: {
     color: colors.text,
     fontSize: 16,
@@ -1746,6 +2003,43 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
     gap: 8,
   },
+  offlineNotice: {
+    minHeight: 34,
+    paddingHorizontal: 12,
+    backgroundColor: "#fffbeb",
+    borderTopWidth: 1,
+    borderTopColor: "#fde68a",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  offlineNoticeText: {
+    color: "#92400e",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  retryNotice: {
+    minHeight: 34,
+    paddingHorizontal: 12,
+    backgroundColor: "#fef2f2",
+    borderTopWidth: 1,
+    borderTopColor: "#fecaca",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  retryNoticeText: {
+    flex: 1,
+    color: colors.danger,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  retryAction: {
+    color: colors.danger,
+    fontSize: 12,
+    fontWeight: "900",
+  },
   attachmentChip: {
     maxWidth: "48%",
     height: 30,
@@ -1772,6 +2066,16 @@ const styles = StyleSheet.create({
     backgroundColor: colors.background,
     alignItems: "center",
     justifyContent: "center",
+  },
+  voiceButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  voiceButtonActive: {
+    backgroundColor: "#dbeafe",
   },
   addPressed: {
     backgroundColor: colors.surfaceMuted,

@@ -1,4 +1,5 @@
 export type RootStackParamList = {
+  Main: undefined;
   Login: undefined;
   Chat: { sessionID?: string } | undefined;
   Sessions: undefined;
@@ -7,6 +8,13 @@ export type RootStackParamList = {
   SessionSettingDetail: { sessionID: string; section: "mode" | "channel" | "agent" | "studio" | "skills" | "mcp" | "connector" };
   SessionAddItems: { sessionID: string; type: "skills" | "mcp" };
   Server: undefined;
+};
+
+export type MainTabParamList = {
+  Chat: { sessionID?: string } | undefined;
+  Sessions: undefined;
+  Settings: undefined;
+  Profile: undefined;
 };
 
 export type ChatRunMode = "chat" | "assistant" | "agent_group";
